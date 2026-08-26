@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+*.log
+/data/guild-config.json
+/data/guild-config.json.tmp

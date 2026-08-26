@@ -1,0 +1,29 @@
+{
+  "name": "karting-oracle-bot",
+  "version": "4.0.0",
+  "private": true,
+  "description": "A Discord bot with verified community knowledge and Supabase-backed feedback voting.",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "lint": "biome lint src test",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "check": "npm run lint && npm test"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2",
+    "openai": "^7.5.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "@biomejs/biome": "^2.5.10",
+    "@types/node": "^26.3.0",
+    "typescript": "^7.0.2"
+  }
+}
