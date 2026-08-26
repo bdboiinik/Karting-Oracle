@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   Client,
+  ChannelType,
   Events,
   GatewayIntentBits,
   MessageFlags,
@@ -31,6 +32,7 @@ import {
   resolveModeratorRoleIds,
 } from "./moderator-roles.js";
 import {
+  buildOracleChannelDiagnostics,
   buildOracleChannelSelector,
   canBotUseOracleChannel,
   canMemberConfigureOracleChannel,
@@ -239,6 +241,39 @@ async function main(): Promise<void> {
     if (existingCommand.description !== ORACLE_SETUP_COMMAND_DESCRIPTION) {
       await guild.commands.edit(existingCommand, commandData);
     }
+  }
+
+  async function inspectOracleChannelSelector(guild: Guild): Promise<
+    string | undefined
+  > {
+    const configuredChannelId = channelConfig.get(guild.id);
+    const [channels, botMember] = await Promise.all([
+      guild.channels.fetch(undefined, { force: true }),
+      guild.members.fetchMe({ force: true }),
+    ]);
+    const diagnostics = buildOracleChannelDiagnostics(
+      channels.values(),
+      botMember,
+      configuredChannelId,
+    );
+
+    console.log(
+      `Oracle channel selector diagnostics for ${guild.name}: ${JSON.stringify({
+        botHasAdministrator: botMember.permissions.has(
+          PermissionFlagsBits.Administrator,
+        ),
+        configuredChannelId: configuredChannelId ?? null,
+        channels: diagnostics,
+      })}`,
+    );
+
+    const configuredChannel = configuredChannelId
+      ? channels.get(configuredChannelId)
+      : undefined;
+
+    return configuredChannel?.type === ChannelType.GuildText
+      ? configuredChannel.id
+      : undefined;
   }
 
   async function findPromptChannel(guild: Guild): Promise<TextChannel | undefined> {
@@ -627,10 +662,23 @@ async function main(): Promise<void> {
         return;
       }
 
+      let defaultChannelId: string | undefined;
+
+      try {
+        defaultChannelId = await inspectOracleChannelSelector(
+          interaction.guild,
+        );
+      } catch (error) {
+        console.error(
+          "Could not collect fresh Oracle channel selector diagnostics:",
+          error,
+        );
+      }
+
       await interaction.reply({
         content:
           "Choose the text channel Karting Oracle should read and reply in. The selection will only be saved if the bot currently has all required permissions.",
-        components: [buildOracleChannelSelector()],
+        components: [buildOracleChannelSelector(defaultChannelId)],
         flags: MessageFlags.Ephemeral,
       });
     })().catch((error: unknown) => {
@@ -695,7 +743,9 @@ async function main(): Promise<void> {
             content: `I cannot save that channel. Karting Oracle is missing: **${missingPermissions.join(
               "**, **",
             )}**. Update the channel permissions, then choose it again.`,
-            components: [buildOracleChannelSelector()],
+            components: [
+              buildOracleChannelSelector(channelConfig.get(interaction.guildId)),
+            ],
           });
           return;
         }
@@ -704,7 +754,9 @@ async function main(): Promise<void> {
           await interaction.editReply({
             content:
               "I cannot save that channel because its current permissions are insufficient.",
-            components: [buildOracleChannelSelector()],
+            components: [
+              buildOracleChannelSelector(channelConfig.get(interaction.guildId)),
+            ],
           });
           return;
         }
@@ -725,7 +777,9 @@ async function main(): Promise<void> {
           .editReply({
             content:
               "I could not save that channel. Check the bot permissions and try again.",
-            components: [buildOracleChannelSelector()],
+            components: [
+              buildOracleChannelSelector(channelConfig.get(interaction.guildId)),
+            ],
           })
           .catch(() => undefined);
       }

@@ -30,7 +30,7 @@ Unverified answers are never used as trusted knowledge, regardless of their vote
 4. Invite the bot to your server.
 5. Start the bot, then run `/oracle-setup` in the server. Members with **Manage Server** or any role in `MODERATOR_ROLE_IDS` may use it.
 
-The setup command responds ephemerally with Discord's native text-channel selector. It can be rerun at any time to refresh the available channels or change the saved Oracle channel. Private text channels can be selected when current Discord permissions make them available, and the bot rechecks **View Channel**, **Send Messages**, and **Read Message History** before saving. If any permission is missing, setup shows an error and keeps the selector available for another attempt. After a successful selection, the dropdown is removed and replaced with `✅ Karting Oracle channel set to #channel-name`.
+The setup command responds ephemerally with Discord's native text-channel selector. It can be rerun at any time to refresh the available channels or change the saved Oracle channel, which is shown as the current default. Private text channels can be selected when current Discord permissions make them available, and the bot rechecks **View Channel**, **Send Messages**, and **Read Message History** before saving. If any permission is missing, setup shows an error and keeps the selector available for another attempt. After a successful selection, the dropdown is removed and replaced with `✅ Karting Oracle channel set to #channel-name`. Each setup run also logs a fresh channel-type and bot-permission inventory to help diagnose channels omitted by Discord's native selector; this diagnostic inventory never filters the selector options.
 
 No `ORACLE_CHANNEL_ID` environment variable is needed.
 

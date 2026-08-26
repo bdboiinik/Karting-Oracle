@@ -9,6 +9,7 @@ import {
 } from "discord.js";
 
 import {
+  buildOracleChannelDiagnostics,
   buildOracleChannelSelector,
   canMemberConfigureOracleChannel,
   missingOracleChannelPermissions,
@@ -24,6 +25,16 @@ test("builds a native selector restricted to one text channel", () => {
   assert.deepEqual(selector?.channel_types, [ChannelType.GuildText]);
   assert.equal(selector?.min_values, 1);
   assert.equal(selector?.max_values, 1);
+  assert.equal("options" in selector, false);
+});
+
+test("marks the currently configured text channel as the native default", () => {
+  const row = buildOracleChannelSelector("123456789").toJSON();
+  const selector = row.components[0];
+
+  assert.deepEqual(selector?.default_values, [
+    { id: "123456789", type: "channel" },
+  ]);
 });
 
 test("reports each missing bot permission for a text channel", () => {
@@ -51,6 +62,57 @@ test("accepts a text channel when all required bot permissions are current", () 
   };
 
   assert.deepEqual(missingOracleChannelPermissions(channel, {}), []);
+});
+
+test("Administrator naturally satisfies all required channel permissions", () => {
+  const channel = {
+    type: ChannelType.GuildText,
+    permissionsFor: () =>
+      new PermissionsBitField([PermissionFlagsBits.Administrator]),
+  };
+
+  assert.deepEqual(missingOracleChannelPermissions(channel, {}), []);
+});
+
+test("fresh selector diagnostics include configured and non-text channels", () => {
+  const administratorPermissions = new PermissionsBitField([
+    PermissionFlagsBits.Administrator,
+  ]);
+  const channels = [
+    {
+      id: "111",
+      name: "karting-oracle",
+      type: ChannelType.GuildText,
+      permissionsFor: () => administratorPermissions,
+    },
+    {
+      id: "222",
+      name: "announcements",
+      type: ChannelType.GuildAnnouncement,
+      permissionsFor: () => administratorPermissions,
+    },
+  ];
+
+  const diagnostics = buildOracleChannelDiagnostics(channels, {}, "111");
+
+  assert.equal(diagnostics.length, 2);
+  assert.deepEqual(
+    diagnostics.find((channel) => channel.id === "111"),
+    {
+      id: "111",
+      name: "karting-oracle",
+      type: ChannelType.GuildText,
+      isGuildText: true,
+      isConfigured: true,
+      canView: true,
+      canSend: true,
+      canReadHistory: true,
+    },
+  );
+  assert.equal(
+    diagnostics.find((channel) => channel.id === "222")?.isGuildText,
+    false,
+  );
 });
 
 test("allows Manage Server or any configured moderator role to run setup", () => {

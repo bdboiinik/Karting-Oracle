@@ -15,13 +15,26 @@ export const ORACLE_SETUP_COMMAND_DESCRIPTION =
   "Choose the text channel Karting Oracle should read and reply in.";
 export const ORACLE_CHANNEL_SELECT_CUSTOM_ID = "karting-oracle-channel";
 
+export interface OracleChannelDiagnostic {
+  id: string;
+  name: string;
+  type: ChannelType;
+  isGuildText: boolean;
+  isConfigured: boolean;
+  canView: boolean;
+  canSend: boolean;
+  canReadHistory: boolean;
+}
+
 const REQUIRED_CHANNEL_PERMISSIONS = [
   { flag: PermissionFlagsBits.ViewChannel, label: "View Channel" },
   { flag: PermissionFlagsBits.SendMessages, label: "Send Messages" },
   { flag: PermissionFlagsBits.ReadMessageHistory, label: "Read Message History" },
 ] as const;
 
-export function buildOracleChannelSelector(): ActionRowBuilder<ChannelSelectMenuBuilder> {
+export function buildOracleChannelSelector(
+  defaultChannelId?: string,
+): ActionRowBuilder<ChannelSelectMenuBuilder> {
   const channelSelect = new ChannelSelectMenuBuilder()
     .setCustomId(ORACLE_CHANNEL_SELECT_CUSTOM_ID)
     .setPlaceholder("Choose the Karting Oracle channel")
@@ -29,9 +42,39 @@ export function buildOracleChannelSelector(): ActionRowBuilder<ChannelSelectMenu
     .setMinValues(1)
     .setMaxValues(1);
 
+  if (defaultChannelId) {
+    channelSelect.setDefaultChannels(defaultChannelId);
+  }
+
   return new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(
     channelSelect,
   );
+}
+
+export function buildOracleChannelDiagnostics(
+  channels: Iterable<GuildBasedChannel | null>,
+  botMember: GuildMember,
+  configuredChannelId?: string,
+): OracleChannelDiagnostic[] {
+  return Array.from(channels)
+    .filter((channel): channel is GuildBasedChannel => channel !== null)
+    .map((channel) => {
+      const permissions = channel.permissionsFor(botMember);
+
+      return {
+        id: channel.id,
+        name: channel.name,
+        type: channel.type,
+        isGuildText: channel.type === ChannelType.GuildText,
+        isConfigured: channel.id === configuredChannelId,
+        canView: permissions.has(PermissionFlagsBits.ViewChannel),
+        canSend: permissions.has(PermissionFlagsBits.SendMessages),
+        canReadHistory: permissions.has(
+          PermissionFlagsBits.ReadMessageHistory,
+        ),
+      };
+    })
+    .sort((first, second) => first.name.localeCompare(second.name));
 }
 
 export function missingOracleChannelPermissions(
