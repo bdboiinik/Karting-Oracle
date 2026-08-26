@@ -1,0 +1,71 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  ChannelType,
+  ComponentType,
+  PermissionFlagsBits,
+  PermissionsBitField,
+} from "discord.js";
+
+import {
+  buildOracleChannelSelector,
+  canMemberConfigureOracleChannel,
+  missingOracleChannelPermissions,
+  ORACLE_CHANNEL_SELECT_CUSTOM_ID,
+} from "../dist/oracle-channel-setup.js";
+
+test("builds a native selector restricted to one text channel", () => {
+  const row = buildOracleChannelSelector().toJSON();
+  const selector = row.components[0];
+
+  assert.equal(selector?.type, ComponentType.ChannelSelect);
+  assert.equal(selector?.custom_id, ORACLE_CHANNEL_SELECT_CUSTOM_ID);
+  assert.deepEqual(selector?.channel_types, [ChannelType.GuildText]);
+  assert.equal(selector?.min_values, 1);
+  assert.equal(selector?.max_values, 1);
+});
+
+test("reports each missing bot permission for a text channel", () => {
+  const channel = {
+    type: ChannelType.GuildText,
+    permissionsFor: () =>
+      new PermissionsBitField([PermissionFlagsBits.ViewChannel]),
+  };
+
+  assert.deepEqual(
+    missingOracleChannelPermissions(channel, {}),
+    ["Send Messages", "Read Message History"],
+  );
+});
+
+test("accepts a text channel when all required bot permissions are current", () => {
+  const channel = {
+    type: ChannelType.GuildText,
+    permissionsFor: () =>
+      new PermissionsBitField([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.ReadMessageHistory,
+      ]),
+  };
+
+  assert.deepEqual(missingOracleChannelPermissions(channel, {}), []);
+});
+
+test("allows Manage Server or any configured moderator role to run setup", () => {
+  const moderatorRoleIds = new Set(["222", "333"]);
+
+  assert.equal(
+    canMemberConfigureOracleChannel(["111"], moderatorRoleIds, true),
+    true,
+  );
+  assert.equal(
+    canMemberConfigureOracleChannel(["111", "333"], moderatorRoleIds, false),
+    true,
+  );
+  assert.equal(
+    canMemberConfigureOracleChannel(["111"], moderatorRoleIds, false),
+    false,
+  );
+});

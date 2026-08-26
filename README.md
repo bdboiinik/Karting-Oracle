@@ -23,12 +23,14 @@ Unverified answers are never used as trusted knowledge, regardless of their vote
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications), then add a bot on the **Bot** page.
 2. Enable the privileged **Message Content Intent**.
-3. Under **OAuth2 > URL Generator**, select the `bot` scope and grant:
+3. Under **OAuth2 > URL Generator**, select the `bot` and `applications.commands` scopes and grant:
    - View Channels
    - Send Messages
    - Read Message History
 4. Invite the bot to your server.
-5. Start the bot. A member with **Manage Server** permission uses its Discord channel picker to choose the Oracle channel.
+5. Start the bot, then run `/oracle-setup` in the server. Members with **Manage Server** or any role in `MODERATOR_ROLE_IDS` may use it.
+
+The setup command responds ephemerally with Discord's native text-channel selector. It can be rerun at any time to refresh the available channels or change the saved Oracle channel. Private text channels can be selected when current Discord permissions make them available, and the bot rechecks **View Channel**, **Send Messages**, and **Read Message History** before saving. If any permission is missing, setup shows an error and keeps the selector available for another attempt. After a successful selection, the dropdown is removed and replaced with `✅ Karting Oracle channel set to #channel-name`.
 
 No `ORACLE_CHANNEL_ID` environment variable is needed.
 

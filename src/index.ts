@@ -3,9 +3,6 @@ import "dotenv/config";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
-  ActionRowBuilder,
-  ChannelSelectMenuBuilder,
-  ChannelType,
   Client,
   Events,
   GatewayIntentBits,
@@ -13,7 +10,6 @@ import {
   PermissionFlagsBits,
   type ButtonInteraction,
   type Guild,
-  type GuildBasedChannel,
   type GuildMember,
   type TextChannel,
 } from "discord.js";
@@ -34,6 +30,15 @@ import {
   memberHasModeratorRole,
   resolveModeratorRoleIds,
 } from "./moderator-roles.js";
+import {
+  buildOracleChannelSelector,
+  canBotUseOracleChannel,
+  canMemberConfigureOracleChannel,
+  missingOracleChannelPermissions,
+  ORACLE_CHANNEL_SELECT_CUSTOM_ID,
+  ORACLE_SETUP_COMMAND_DESCRIPTION,
+  ORACLE_SETUP_COMMAND_NAME,
+} from "./oracle-channel-setup.js";
 import {
   buildOracleInput,
   ORACLE_INSTRUCTIONS,
@@ -57,15 +62,9 @@ import {
 const DISCORD_MESSAGE_LIMIT = 2_000;
 const OPENAI_MODEL = "gpt-5-mini";
 const OPENAI_OUTPUT_TOKEN_LIMITS = [1_500, 2_500] as const;
-const CHANNEL_SELECT_CUSTOM_ID = "karting-oracle-channel";
 const CHANNEL_CONFIG_PATH = fileURLToPath(
   new URL("../data/guild-config.json", import.meta.url),
 );
-const REQUIRED_CHANNEL_PERMISSIONS = [
-  PermissionFlagsBits.ViewChannel,
-  PermissionFlagsBits.SendMessages,
-  PermissionFlagsBits.ReadMessageHistory,
-] as const;
 
 const requiredEnvironmentVariables = [
   "DISCORD_TOKEN",
@@ -84,27 +83,6 @@ function readEnvironmentVariable(name: EnvironmentVariable): string {
   }
 
   return value;
-}
-
-function canBotUseChannel(
-  channel: GuildBasedChannel | null | undefined,
-  botMember: GuildMember,
-): channel is TextChannel {
-  return (
-    channel?.type === ChannelType.GuildText &&
-    channel.permissionsFor(botMember).has(REQUIRED_CHANNEL_PERMISSIONS)
-  );
-}
-
-function buildChannelSelector(): ActionRowBuilder<ChannelSelectMenuBuilder> {
-  const channelSelect = new ChannelSelectMenuBuilder()
-    .setCustomId(CHANNEL_SELECT_CUSTOM_ID)
-    .setPlaceholder("Choose the Karting Oracle channel")
-    .setChannelTypes(ChannelType.GuildText)
-    .setMinValues(1)
-    .setMaxValues(1);
-
-  return new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(channelSelect);
 }
 
 function feedbackVoteLabel(vote: VoteType): string {
@@ -221,17 +199,59 @@ async function main(): Promise<void> {
     ];
   }
 
+  async function canUserConfigureOracleChannel(
+    guild: Guild,
+    discordUserId: string,
+    hasManageGuildPermission: boolean,
+  ): Promise<boolean> {
+    if (hasManageGuildPermission) {
+      return true;
+    }
+
+    const member = await guild.members.fetch({
+      user: discordUserId,
+      force: true,
+    });
+
+    return canMemberConfigureOracleChannel(
+      member.roles.cache.keys(),
+      moderatorRoleIds,
+      false,
+    );
+  }
+
+  async function registerOracleSetupCommand(guild: Guild): Promise<void> {
+    const commands = await guild.commands.fetch();
+    const existingCommand = commands.find(
+      (command) => command.name === ORACLE_SETUP_COMMAND_NAME,
+    );
+    const commandData = {
+      name: ORACLE_SETUP_COMMAND_NAME,
+      description: ORACLE_SETUP_COMMAND_DESCRIPTION,
+    };
+
+    if (!existingCommand) {
+      await guild.commands.create(commandData);
+      console.log(`Registered /${ORACLE_SETUP_COMMAND_NAME} on ${guild.name}.`);
+      return;
+    }
+
+    if (existingCommand.description !== ORACLE_SETUP_COMMAND_DESCRIPTION) {
+      await guild.commands.edit(existingCommand, commandData);
+    }
+  }
+
   async function findPromptChannel(guild: Guild): Promise<TextChannel | undefined> {
     await guild.channels.fetch();
-    const botMember = guild.members.me ?? (await guild.members.fetchMe());
+    const botMember = await guild.members.fetchMe({ force: true });
 
-    if (canBotUseChannel(guild.systemChannel, botMember)) {
+    if (canBotUseOracleChannel(guild.systemChannel, botMember)) {
       return guild.systemChannel;
     }
 
     const availableChannels = guild.channels.cache
       .filter((channel): channel is TextChannel =>
-        canBotUseChannel(channel, botMember),
+        canBotUseOracleChannel(channel, botMember),
       )
       .sort(
         (firstChannel, secondChannel) =>
@@ -267,13 +287,14 @@ async function main(): Promise<void> {
 
       await promptChannel.send({
         content:
-          "Thanks for adding Karting Oracle! A server administrator can choose the one text channel I should read and reply in:",
-        components: [buildChannelSelector()],
+          `Thanks for adding Karting Oracle! A server administrator or configured moderator can run \`/${ORACLE_SETUP_COMMAND_NAME}\` to choose the text channel I should read and reply in.`,
         allowedMentions: { parse: [] },
       });
 
       promptedGuildIds.add(guild.id);
-      console.log(`Asked ${guild.name} to choose an Oracle channel in #${promptChannel.name}.`);
+      console.log(
+        `Asked ${guild.name} to run /${ORACLE_SETUP_COMMAND_NAME} in #${promptChannel.name}.`,
+      );
     } finally {
       promptingGuildIds.delete(guild.id);
     }
@@ -283,11 +304,12 @@ async function main(): Promise<void> {
     const configuredChannelId = channelConfig.get(guild.id);
 
     if (configuredChannelId) {
-      await guild.channels.fetch();
-      const configuredChannel = guild.channels.cache.get(configuredChannelId);
-      const botMember = guild.members.me ?? (await guild.members.fetchMe());
+      const configuredChannel = await guild.channels.fetch(configuredChannelId, {
+        force: true,
+      });
+      const botMember = await guild.members.fetchMe({ force: true });
 
-      if (canBotUseChannel(configuredChannel, botMember)) {
+      if (canBotUseOracleChannel(configuredChannel, botMember)) {
         console.log(`Listening in #${configuredChannel.name} on ${guild.name}.`);
         return;
       }
@@ -300,6 +322,19 @@ async function main(): Promise<void> {
     }
 
     await promptForChannel(guild);
+  }
+
+  async function prepareGuild(guild: Guild): Promise<void> {
+    try {
+      await registerOracleSetupCommand(guild);
+    } catch (error) {
+      console.error(
+        `Could not register /${ORACLE_SETUP_COMMAND_NAME} on ${guild.name}:`,
+        error,
+      );
+    }
+
+    await ensureGuildConfiguration(guild);
   }
 
   client.once(Events.ClientReady, (readyClient) => {
@@ -317,7 +352,7 @@ async function main(): Promise<void> {
     void (async () => {
       for (const guild of readyClient.guilds.cache.values()) {
         try {
-          await ensureGuildConfiguration(guild);
+          await prepareGuild(guild);
         } catch (error) {
           console.error(`Could not configure ${guild.name}:`, error);
         }
@@ -326,7 +361,7 @@ async function main(): Promise<void> {
   });
 
   client.on(Events.GuildCreate, (guild) => {
-    void ensureGuildConfiguration(guild).catch((error: unknown) => {
+    void prepareGuild(guild).catch((error: unknown) => {
       console.error(`Could not configure ${guild.name}:`, error);
     });
   });
@@ -557,53 +592,141 @@ async function main(): Promise<void> {
 
   client.on(Events.InteractionCreate, (interaction) => {
     if (
-      !interaction.isChannelSelectMenu() ||
-      interaction.customId !== CHANNEL_SELECT_CUSTOM_ID ||
+      !interaction.isChatInputCommand() ||
+      interaction.commandName !== ORACLE_SETUP_COMMAND_NAME ||
       !interaction.inCachedGuild()
     ) {
       return;
     }
 
     void (async () => {
-      if (!interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild)) {
+      let canConfigure: boolean;
+
+      try {
+        canConfigure = await canUserConfigureOracleChannel(
+          interaction.guild,
+          interaction.user.id,
+          interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild),
+        );
+      } catch (error) {
+        console.error("Could not check Oracle setup permissions:", error);
         await interaction.reply({
-          content: "Only a server administrator can choose the Oracle channel.",
+          content:
+            "I could not check your Oracle setup permissions right now. Please try again.",
           flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      if (!canConfigure) {
+        await interaction.reply({
+          content:
+            "Only members with Manage Server or a configured moderator role can change the Oracle channel.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        content:
+          "Choose the text channel Karting Oracle should read and reply in. The selection will only be saved if the bot currently has all required permissions.",
+        components: [buildOracleChannelSelector()],
+        flags: MessageFlags.Ephemeral,
+      });
+    })().catch((error: unknown) => {
+      console.error(`Could not run /${ORACLE_SETUP_COMMAND_NAME}:`, error);
+    });
+  });
+
+  client.on(Events.InteractionCreate, (interaction) => {
+    if (
+      !interaction.isChannelSelectMenu() ||
+      interaction.customId !== ORACLE_CHANNEL_SELECT_CUSTOM_ID ||
+      !interaction.inCachedGuild()
+    ) {
+      return;
+    }
+
+    void (async () => {
+      let canConfigure: boolean;
+
+      try {
+        canConfigure = await canUserConfigureOracleChannel(
+          interaction.guild,
+          interaction.user.id,
+          interaction.memberPermissions.has(PermissionFlagsBits.ManageGuild),
+        );
+      } catch (error) {
+        console.error("Could not check Oracle setup permissions:", error);
+        await interaction.reply({
+          content:
+            "I could not check your Oracle setup permissions right now. Please try again.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      if (!canConfigure) {
+        await interaction.reply({
+          content:
+            "Only members with Manage Server or a configured moderator role can change the Oracle channel.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.deferUpdate();
 
       try {
         const selectedChannelId = interaction.values[0];
         const selectedChannel = selectedChannelId
-          ? await interaction.guild.channels.fetch(selectedChannelId)
+          ? await interaction.guild.channels.fetch(selectedChannelId, {
+              force: true,
+            })
           : null;
-        const botMember =
-          interaction.guild.members.me ??
-          (await interaction.guild.members.fetchMe());
+        const botMember = await interaction.guild.members.fetchMe({ force: true });
+        const missingPermissions = missingOracleChannelPermissions(
+          selectedChannel,
+          botMember,
+        );
 
-        if (!canBotUseChannel(selectedChannel, botMember)) {
-          await interaction.editReply(
-            "I need View Channel, Send Messages, and Read Message History permissions in that text channel.",
-          );
+        if (!selectedChannel || missingPermissions.length > 0) {
+          await interaction.editReply({
+            content: `I cannot save that channel. Karting Oracle is missing: **${missingPermissions.join(
+              "**, **",
+            )}**. Update the channel permissions, then choose it again.`,
+            components: [buildOracleChannelSelector()],
+          });
+          return;
+        }
+
+        if (!canBotUseOracleChannel(selectedChannel, botMember)) {
+          await interaction.editReply({
+            content:
+              "I cannot save that channel because its current permissions are insufficient.",
+            components: [buildOracleChannelSelector()],
+          });
           return;
         }
 
         await channelConfig.set(interaction.guildId, selectedChannel.id);
         promptedGuildIds.add(interaction.guildId);
 
-        await interaction.editReply(
-          `Configured ${selectedChannel}. I will only read and reply in that channel. You can use the menu again to change it.`,
-        );
+        await interaction.editReply({
+          content: `\u2705 Karting Oracle channel set to #${selectedChannel.name}`,
+          components: [],
+        });
         console.log(
           `Configured #${selectedChannel.name} as the Oracle channel for ${interaction.guild.name}.`,
         );
       } catch (error) {
         console.error("Could not save the selected Oracle channel:", error);
         await interaction
-          .editReply("I could not save that channel. Please try again.")
+          .editReply({
+            content:
+              "I could not save that channel. Check the bot permissions and try again.",
+            components: [buildOracleChannelSelector()],
+          })
           .catch(() => undefined);
       }
     })().catch((error: unknown) => {
