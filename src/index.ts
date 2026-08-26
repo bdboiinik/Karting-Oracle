@@ -32,14 +32,18 @@ import {
   resolveModeratorRoleIds,
 } from "./moderator-roles.js";
 import {
+  buildOracleCommand,
   buildOracleChannelDiagnostics,
   buildOracleChannelSelector,
   canBotUseOracleChannel,
   canMemberConfigureOracleChannel,
+  isOracleSetupCommand,
+  LEGACY_ORACLE_SETUP_COMMAND_NAME,
+  ORACLE_COMMAND_NAME,
   missingOracleChannelPermissions,
   ORACLE_CHANNEL_SELECT_CUSTOM_ID,
-  ORACLE_SETUP_COMMAND_DESCRIPTION,
-  ORACLE_SETUP_COMMAND_NAME,
+  ORACLE_SETUP_HANDLER_VERSION,
+  ORACLE_SETUP_SUBCOMMAND_NAME,
 } from "./oracle-channel-setup.js";
 import {
   buildOracleInput,
@@ -225,43 +229,41 @@ async function main(): Promise<void> {
   async function registerOracleSetupCommand(guild: Guild): Promise<void> {
     const commands = await guild.commands.fetch();
     const existingCommand = commands.find(
-      (command) => command.name === ORACLE_SETUP_COMMAND_NAME,
+      (command) => command.name === ORACLE_COMMAND_NAME,
     );
-    const commandData = {
-      name: ORACLE_SETUP_COMMAND_NAME,
-      description: ORACLE_SETUP_COMMAND_DESCRIPTION,
-    };
+    const legacyCommand = commands.find(
+      (command) => command.name === LEGACY_ORACLE_SETUP_COMMAND_NAME,
+    );
+    const commandData = buildOracleCommand();
 
     if (!existingCommand) {
       await guild.commands.create(commandData);
-      console.log(`Registered /${ORACLE_SETUP_COMMAND_NAME} on ${guild.name}.`);
-      return;
-    }
-
-    if (existingCommand.description !== ORACLE_SETUP_COMMAND_DESCRIPTION) {
+    } else {
       await guild.commands.edit(existingCommand, commandData);
     }
+
+    if (legacyCommand) {
+      await guild.commands.delete(legacyCommand.id);
+    }
+
+    console.log(
+      `Registered /${ORACLE_COMMAND_NAME} ${ORACLE_SETUP_SUBCOMMAND_NAME} on ${guild.name} (${guild.id}); removedLegacyCommand=${Boolean(legacyCommand)}.`,
+    );
   }
 
   async function inspectOracleChannelSelector(guild: Guild): Promise<
     string | undefined
   > {
     const configuredChannelId = channelConfig.get(guild.id);
-    const [channels, botMember] = await Promise.all([
-      guild.channels.fetch(undefined, { force: true }),
-      guild.members.fetchMe({ force: true }),
-    ]);
+    const channels = await guild.channels.fetch(undefined, { force: true });
     const diagnostics = buildOracleChannelDiagnostics(
       channels.values(),
-      botMember,
       configuredChannelId,
     );
 
     console.log(
       `Oracle channel selector diagnostics for ${guild.name}: ${JSON.stringify({
-        botHasAdministrator: botMember.permissions.has(
-          PermissionFlagsBits.Administrator,
-        ),
+        guildId: guild.id,
         configuredChannelId: configuredChannelId ?? null,
         channels: diagnostics,
       })}`,
@@ -322,13 +324,13 @@ async function main(): Promise<void> {
 
       await promptChannel.send({
         content:
-          `Thanks for adding Karting Oracle! A server administrator or configured moderator can run \`/${ORACLE_SETUP_COMMAND_NAME}\` to choose the text channel I should read and reply in.`,
+          `Thanks for adding Karting Oracle! A server administrator or configured moderator can run \`/${ORACLE_COMMAND_NAME} ${ORACLE_SETUP_SUBCOMMAND_NAME}\` to choose the text channel I should read and reply in.`,
         allowedMentions: { parse: [] },
       });
 
       promptedGuildIds.add(guild.id);
       console.log(
-        `Asked ${guild.name} to run /${ORACLE_SETUP_COMMAND_NAME} in #${promptChannel.name}.`,
+        `Asked ${guild.name} to run /${ORACLE_COMMAND_NAME} ${ORACLE_SETUP_SUBCOMMAND_NAME} in #${promptChannel.name}.`,
       );
     } finally {
       promptingGuildIds.delete(guild.id);
@@ -364,7 +366,7 @@ async function main(): Promise<void> {
       await registerOracleSetupCommand(guild);
     } catch (error) {
       console.error(
-        `Could not register /${ORACLE_SETUP_COMMAND_NAME} on ${guild.name}:`,
+        `Could not register /${ORACLE_COMMAND_NAME} ${ORACLE_SETUP_SUBCOMMAND_NAME} on ${guild.name}:`,
         error,
       );
     }
@@ -628,7 +630,11 @@ async function main(): Promise<void> {
   client.on(Events.InteractionCreate, (interaction) => {
     if (
       !interaction.isChatInputCommand() ||
-      interaction.commandName !== ORACLE_SETUP_COMMAND_NAME ||
+      interaction.commandName !== ORACLE_COMMAND_NAME ||
+      !isOracleSetupCommand(
+        interaction.commandName,
+        interaction.options.getSubcommand(false),
+      ) ||
       !interaction.inCachedGuild()
     ) {
       return;
@@ -675,14 +681,34 @@ async function main(): Promise<void> {
         );
       }
 
+      const selector = buildOracleChannelSelector(defaultChannelId);
+      const selectorJson = selector.toJSON();
+      const component = selectorJson.components[0];
+
+      console.log(
+        `Oracle setup handler executed: ${JSON.stringify({
+          handlerVersion: ORACLE_SETUP_HANDLER_VERSION,
+          guildId: interaction.guildId,
+          command: `/${interaction.commandName} ${interaction.options.getSubcommand(false)}`,
+          actionRowComponentType: selectorJson.type,
+          selectorComponentType: component?.type,
+          expectedNativeChannelSelectType: 8,
+          hasStaticOptions:
+            component !== undefined && "options" in component,
+        })}`,
+      );
+
       await interaction.reply({
         content:
           "Choose the text channel Karting Oracle should read and reply in. The selection will only be saved if the bot currently has all required permissions.",
-        components: [buildOracleChannelSelector(defaultChannelId)],
+        components: [selector],
         flags: MessageFlags.Ephemeral,
       });
     })().catch((error: unknown) => {
-      console.error(`Could not run /${ORACLE_SETUP_COMMAND_NAME}:`, error);
+      console.error(
+        `Could not run /${ORACLE_COMMAND_NAME} ${ORACLE_SETUP_SUBCOMMAND_NAME}:`,
+        error,
+      );
     });
   });
 

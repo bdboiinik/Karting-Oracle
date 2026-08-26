@@ -9,12 +9,28 @@ import {
 } from "discord.js";
 
 import {
+  buildOracleCommand,
   buildOracleChannelDiagnostics,
   buildOracleChannelSelector,
   canMemberConfigureOracleChannel,
+  isOracleSetupCommand,
   missingOracleChannelPermissions,
   ORACLE_CHANNEL_SELECT_CUSTOM_ID,
+  ORACLE_COMMAND_NAME,
+  ORACLE_SETUP_SUBCOMMAND_NAME,
 } from "../dist/oracle-channel-setup.js";
+
+test("registers the setup route as /oracle setup", () => {
+  const command = buildOracleCommand().toJSON();
+
+  assert.equal(command.name, ORACLE_COMMAND_NAME);
+  assert.deepEqual(
+    command.options?.map((option) => option.name),
+    [ORACLE_SETUP_SUBCOMMAND_NAME],
+  );
+  assert.equal(isOracleSetupCommand("oracle", "setup"), true);
+  assert.equal(isOracleSetupCommand("oracle-setup", null), false);
+});
 
 test("builds a native selector restricted to one text channel", () => {
   const row = buildOracleChannelSelector().toJSON();
@@ -75,25 +91,20 @@ test("Administrator naturally satisfies all required channel permissions", () =>
 });
 
 test("fresh selector diagnostics include configured and non-text channels", () => {
-  const administratorPermissions = new PermissionsBitField([
-    PermissionFlagsBits.Administrator,
-  ]);
   const channels = [
     {
       id: "111",
       name: "karting-oracle",
       type: ChannelType.GuildText,
-      permissionsFor: () => administratorPermissions,
     },
     {
       id: "222",
       name: "announcements",
       type: ChannelType.GuildAnnouncement,
-      permissionsFor: () => administratorPermissions,
     },
   ];
 
-  const diagnostics = buildOracleChannelDiagnostics(channels, {}, "111");
+  const diagnostics = buildOracleChannelDiagnostics(channels, "111");
 
   assert.equal(diagnostics.length, 2);
   assert.deepEqual(
@@ -104,9 +115,6 @@ test("fresh selector diagnostics include configured and non-text channels", () =
       type: ChannelType.GuildText,
       isGuildText: true,
       isConfigured: true,
-      canView: true,
-      canSend: true,
-      canReadHistory: true,
     },
   );
   assert.equal(
