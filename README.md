@@ -32,15 +32,21 @@ Unverified answers are never used as trusted knowledge, regardless of their vote
 
 No `ORACLE_CHANNEL_ID` environment variable is needed.
 
-### Create and copy the moderator role ID
+### Create and copy the moderator role IDs
 
 1. In Discord, open **Server Settings > Roles**.
-2. Create or select a role such as `Oracle Moderator` and assign it to each moderator who should verify answers.
+2. Create or select one or more roles whose members should be allowed to verify answers.
 3. Open **User Settings > Advanced** and enable **Developer Mode**.
-4. Return to **Server Settings > Roles**, right-click the moderator role, and select **Copy Role ID**.
-5. Paste that numeric ID into `MODERATOR_ROLE_ID` in `.env`.
+4. Return to **Server Settings > Roles**, right-click each moderator role, and select **Copy Role ID**.
+5. Paste the numeric IDs into `MODERATOR_ROLE_IDS` in `.env`, separated by commas.
 
-The verification button is visible on bot answers so moderators can use it. Permission is not based on visibility: every click is checked by the running bot against the configured role ID before any database update occurs.
+For example:
+
+```dotenv
+MODERATOR_ROLE_IDS=123456789,987654321,555555555
+```
+
+Whitespace around IDs and empty entries are ignored. A member is a moderator if they have any one of the configured roles. The verification button is visible on bot answers so moderators can use it. Permission is not based on visibility: every click is checked by the running bot against all configured role IDs before any database update occurs.
 
 ## Supabase setup and V4 migration
 
@@ -81,7 +87,7 @@ DISCORD_TOKEN=your_discord_bot_token
 OPENAI_API_KEY=your_openai_api_key
 SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=sb_secret_your_backend_secret_key
-MODERATOR_ROLE_ID=your_discord_moderator_role_id
+MODERATOR_ROLE_IDS=123456789,987654321,555555555
 ```
 
 Where to find them:
@@ -90,7 +96,9 @@ Where to find them:
 - `OPENAI_API_KEY`: OpenAI API dashboard, **API keys**.
 - `SUPABASE_URL`: Supabase project **Connect** dialog or **Integrations > Data API**. The base project URL and the displayed `/rest/v1/` URL are both accepted.
 - `SUPABASE_SERVICE_ROLE_KEY`: Supabase **Settings > API Keys**, backend Secret key beginning with `sb_secret_`; a legacy `service_role` key also works.
-- `MODERATOR_ROLE_ID`: the numeric Discord role ID copied using Developer Mode as described above.
+- `MODERATOR_ROLE_IDS`: one or more numeric Discord role IDs copied using Developer Mode, separated by commas.
+
+For backwards compatibility, the bot still accepts the singular `MODERATOR_ROLE_ID` variable when `MODERATOR_ROLE_IDS` is missing or contains no usable IDs. New configurations should use `MODERATOR_ROLE_IDS`.
 
 `.env` and `.env.*` are excluded by `.gitignore`; `.env.example` contains placeholders only.
 
@@ -122,7 +130,7 @@ If retrieval fails, the failure is logged safely and the bot answers normally wi
 
 ### 1. Verify an answer
 
-1. Ensure your Discord account has the role whose ID is in `MODERATOR_ROLE_ID`.
+1. Ensure your Discord account has at least one role listed in `MODERATOR_ROLE_IDS`.
 2. Ask a distinctive karting question in the configured Oracle channel.
 3. Click **Verify Answer** beneath the response.
 4. Confirm only you receive the ephemeral message: `Answer verified. It can now support similar future answers.`
@@ -155,9 +163,9 @@ Full-text matching is deliberately simple in V4. If the first similar question d
 
 ### 4. Confirm a non-moderator is denied
 
-1. Use a second Discord account, or temporarily test with an account that does not have the configured moderator role.
+1. Use a second Discord account, or temporarily test with an account that has none of the configured moderator roles.
 2. Click **Verify Answer**.
-3. Confirm only that user sees the ephemeral denial: `Only members with the configured moderator role can verify answers.`
+3. Confirm only that user sees the ephemeral denial: `Only members with a configured moderator role can verify answers.`
 4. Confirm the public answer, button, and Supabase verification fields remain unchanged.
 
 Finally, repeat the V3 voting checks: cast Helpful and Not Helpful votes, change a vote, ask multiple questions, and restart the bot. Vote totals and verification state should remain persisted and independent for every answer.

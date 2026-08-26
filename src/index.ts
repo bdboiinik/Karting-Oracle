@@ -31,6 +31,10 @@ import {
 } from "./feedback.js";
 import type { RecordedVote, VoteTotals, VoteType } from "./feedback-types.js";
 import {
+  memberHasModeratorRole,
+  resolveModeratorRoleIds,
+} from "./moderator-roles.js";
+import {
   buildOracleInput,
   ORACLE_INSTRUCTIONS,
   ORACLE_RESPONSE_FORMAT,
@@ -54,7 +58,6 @@ const DISCORD_MESSAGE_LIMIT = 2_000;
 const OPENAI_MODEL = "gpt-5-mini";
 const OPENAI_OUTPUT_TOKEN_LIMITS = [1_500, 2_500] as const;
 const CHANNEL_SELECT_CUSTOM_ID = "karting-oracle-channel";
-const DISCORD_SNOWFLAKE_PATTERN = /^\d{17,20}$/;
 const CHANNEL_CONFIG_PATH = fileURLToPath(
   new URL("../data/guild-config.json", import.meta.url),
 );
@@ -69,7 +72,6 @@ const requiredEnvironmentVariables = [
   "OPENAI_API_KEY",
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
-  "MODERATOR_ROLE_ID",
 ] as const;
 
 type EnvironmentVariable = (typeof requiredEnvironmentVariables)[number];
@@ -145,11 +147,7 @@ async function main(): Promise<void> {
   const supabaseServiceRoleKey = readEnvironmentVariable(
     "SUPABASE_SERVICE_ROLE_KEY",
   );
-  const moderatorRoleId = readEnvironmentVariable("MODERATOR_ROLE_ID");
-
-  if (!DISCORD_SNOWFLAKE_PATTERN.test(moderatorRoleId)) {
-    throw new Error("MODERATOR_ROLE_ID must be a valid Discord role ID.");
-  }
+  const moderatorRoleIds = resolveModeratorRoleIds(process.env);
 
   const channelConfig = new ChannelConfigStore(CHANNEL_CONFIG_PATH);
   const answerUpdates = new KeyedSerialQueue();
@@ -431,9 +429,11 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (!member.roles.cache.has(moderatorRoleId)) {
+    if (
+      !memberHasModeratorRole(member.roles.cache.keys(), moderatorRoleIds)
+    ) {
       await interaction.editReply(
-        "Only members with the configured moderator role can verify answers.",
+        "Only members with a configured moderator role can verify answers.",
       );
       return;
     }
