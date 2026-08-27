@@ -26,7 +26,7 @@ test("registers the setup route as /oracle setup", () => {
   assert.equal(command.name, ORACLE_COMMAND_NAME);
   assert.deepEqual(
     command.options?.map((option) => option.name),
-    [ORACLE_SETUP_SUBCOMMAND_NAME],
+    [ORACLE_SETUP_SUBCOMMAND_NAME, "reset", "limit", "knowledge"],
   );
   assert.equal(isOracleSetupCommand("oracle", "setup"), true);
   assert.equal(isOracleSetupCommand("oracle-setup", null), false);

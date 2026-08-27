@@ -10,9 +10,16 @@ import {
 } from "discord.js";
 
 import { memberHasModeratorRole } from "./moderator-roles.js";
+import {
+  KNOWLEDGE_CATEGORIES,
+  KNOWLEDGE_CATEGORY_LABELS,
+} from "./structured-knowledge.js";
 
 export const ORACLE_COMMAND_NAME = "oracle";
 export const ORACLE_SETUP_SUBCOMMAND_NAME = "setup";
+export const ORACLE_RESET_SUBCOMMAND_NAME = "reset";
+export const ORACLE_LIMIT_GROUP_NAME = "limit";
+export const ORACLE_KNOWLEDGE_GROUP_NAME = "knowledge";
 export const ORACLE_SETUP_COMMAND_DESCRIPTION =
   "Choose the text channel Karting Oracle should read and reply in.";
 export const ORACLE_CHANNEL_SELECT_CUSTOM_ID = "karting-oracle-channel";
@@ -53,6 +60,11 @@ export function buildOracleChannelSelector(
 }
 
 export function buildOracleCommand() {
+  const categoryChoices = KNOWLEDGE_CATEGORIES.map((category) => ({
+    name: KNOWLEDGE_CATEGORY_LABELS[category],
+    value: category,
+  }));
+
   return new SlashCommandBuilder()
     .setName(ORACLE_COMMAND_NAME)
     .setDescription("Configure Karting Oracle.")
@@ -60,6 +72,131 @@ export function buildOracleCommand() {
       subcommand
         .setName(ORACLE_SETUP_SUBCOMMAND_NAME)
         .setDescription(ORACLE_SETUP_COMMAND_DESCRIPTION),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName(ORACLE_RESET_SUBCOMMAND_NAME)
+        .setDescription("Clear your own Karting Oracle conversation context."),
+    )
+    .addSubcommandGroup((group) =>
+      group
+        .setName(ORACLE_LIMIT_GROUP_NAME)
+        .setDescription("Configure the daily AI-question allowance.")
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("daily")
+            .setDescription("Set the daily AI-question limit for non-moderators.")
+            .addIntegerOption((option) =>
+              option
+                .setName("number")
+                .setDescription("Questions allowed per user per UTC day.")
+                .setRequired(true)
+                .setMinValue(1)
+                .setMaxValue(1_000),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("off")
+            .setDescription("Disable the daily AI-question limit."),
+        ),
+    )
+    .addSubcommandGroup((group) =>
+      group
+        .setName(ORACLE_KNOWLEDGE_GROUP_NAME)
+        .setDescription("Manage authoritative Karting Oracle knowledge.")
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("add")
+            .setDescription("Add an authoritative knowledge item.")
+            .addStringOption((option) =>
+              option
+                .setName("category")
+                .setDescription("Knowledge category.")
+                .setRequired(true)
+                .addChoices(...categoryChoices),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("title")
+                .setDescription("Short descriptive title.")
+                .setRequired(true)
+                .setMaxLength(100),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("content")
+                .setDescription("Authoritative information to store.")
+                .setRequired(true)
+                .setMaxLength(1_800),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("url")
+                .setDescription("Optional HTTP/HTTPS URL.")
+                .setMaxLength(500),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("edit")
+            .setDescription("Edit an existing knowledge item.")
+            .addStringOption((option) =>
+              option
+                .setName("id")
+                .setDescription("Knowledge item UUID.")
+                .setRequired(true),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("category")
+                .setDescription("Replacement category.")
+                .addChoices(...categoryChoices),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("title")
+                .setDescription("Replacement title.")
+                .setMaxLength(100),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("content")
+                .setDescription("Replacement authoritative content.")
+                .setMaxLength(1_800),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("url")
+                .setDescription("Replacement URL, or 'none' to clear it.")
+                .setMaxLength(500),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("view")
+            .setDescription("View one item or the latest knowledge items.")
+            .addStringOption((option) =>
+              option.setName("id").setDescription("Optional knowledge item UUID."),
+            )
+            .addStringOption((option) =>
+              option
+                .setName("category")
+                .setDescription("Optional category filter.")
+                .addChoices(...categoryChoices),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("deactivate")
+            .setDescription("Deactivate a knowledge item.")
+            .addStringOption((option) =>
+              option
+                .setName("id")
+                .setDescription("Knowledge item UUID.")
+                .setRequired(true),
+            ),
+        ),
     );
 }
 

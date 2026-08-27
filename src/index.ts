@@ -10,8 +10,10 @@ import {
   MessageFlags,
   PermissionFlagsBits,
   type ButtonInteraction,
+  type ChatInputCommandInteraction,
   type Guild,
-  type GuildMember,
+  type Message,
+  type ModalSubmitInteraction,
   type TextChannel,
 } from "discord.js";
 import OpenAI from "openai";
@@ -19,8 +21,25 @@ import OpenAI from "openai";
 import {
   renderAnswerContent,
   updateVerificationPresentation,
+  VERIFIED_KNOWLEDGE_NOTE,
 } from "./answer-presentation.js";
+import {
+  answerEditIdFromCustomId,
+  buildAnswerEditModal,
+  buildModeratorAnswerButtons,
+  editedAnswerFromModalFields,
+} from "./answer-editing.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
+import {
+  resolveConversationContextLimits,
+  selectConversationContext,
+  type ConversationMessage,
+} from "./conversation-context.js";
+import {
+  formatRemainingQuestions,
+  limitReachedMessage,
+  type DailyQuestionReservation,
+} from "./daily-limit.js";
 import {
   buildFeedbackButtons,
   feedbackButtonFromCustomId,
@@ -42,6 +61,9 @@ import {
   ORACLE_COMMAND_NAME,
   missingOracleChannelPermissions,
   ORACLE_CHANNEL_SELECT_CUSTOM_ID,
+  ORACLE_KNOWLEDGE_GROUP_NAME,
+  ORACLE_LIMIT_GROUP_NAME,
+  ORACLE_RESET_SUBCOMMAND_NAME,
   ORACLE_SETUP_HANDLER_VERSION,
   ORACLE_SETUP_SUBCOMMAND_NAME,
 } from "./oracle-channel-setup.js";
@@ -53,21 +75,31 @@ import {
   type OracleAnswer,
 } from "./oracle-response.js";
 import {
+  isKnowledgeCategory,
+  KNOWLEDGE_CATEGORY_LABELS,
+  normalizeOptionalKnowledgeUrl,
+  renderKnowledgeItem,
+} from "./structured-knowledge.js";
+import {
   isMissingAnswerError,
   SupabasePersistenceError,
   SupabaseService,
   type AnswerVerification,
+  type UpdateStructuredKnowledgeInput,
   type VerifiedKnowledge,
 } from "./supabase-service.js";
 import {
-  buildVerificationButton,
   type VerificationAction,
   verificationButtonFromCustomId,
 } from "./verification.js";
+import {
+  classifyTopic,
+  OFF_TOPIC_RESPONSE,
+} from "./topic-gate.js";
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
 const OPENAI_MODEL = "gpt-5-mini";
-const OPENAI_OUTPUT_TOKEN_LIMITS = [1_500, 2_500] as const;
+const OPENAI_OUTPUT_TOKEN_LIMIT = 2_500;
 const CHANNEL_CONFIG_PATH = fileURLToPath(
   new URL("../data/guild-config.json", import.meta.url),
 );
@@ -132,9 +164,11 @@ async function main(): Promise<void> {
     "SUPABASE_SERVICE_ROLE_KEY",
   );
   const moderatorRoleIds = resolveModeratorRoleIds(process.env);
+  const conversationLimits = resolveConversationContextLimits(process.env);
 
   const channelConfig = new ChannelConfigStore(CHANNEL_CONFIG_PATH);
   const answerUpdates = new KeyedSerialQueue();
+  const questionUpdates = new KeyedSerialQueue();
   const promptedGuildIds = new Set<string>();
   const promptingGuildIds = new Set<string>();
 
@@ -153,45 +187,44 @@ async function main(): Promise<void> {
   async function generateOracleAnswer(
     prompt: string,
     verifiedKnowledge: VerifiedKnowledge[],
+    structuredKnowledge: Awaited<
+      ReturnType<SupabaseService["searchStructuredKnowledge"]>
+    >,
+    conversation: Awaited<
+      ReturnType<SupabaseService["getConversationHistory"]>
+    >,
   ): Promise<OracleAnswer> {
-    for (const maxOutputTokens of OPENAI_OUTPUT_TOKEN_LIMITS) {
-      const response = await openai.responses.create({
-        model: OPENAI_MODEL,
-        instructions: ORACLE_INSTRUCTIONS,
-        input: buildOracleInput(prompt, verifiedKnowledge),
-        max_output_tokens: maxOutputTokens,
-        text: {
-          format: ORACLE_RESPONSE_FORMAT,
-        },
-      });
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      instructions: ORACLE_INSTRUCTIONS,
+      input: buildOracleInput(
+        prompt,
+        verifiedKnowledge,
+        structuredKnowledge,
+        conversation,
+      ),
+      max_output_tokens: OPENAI_OUTPUT_TOKEN_LIMIT,
+      text: {
+        format: ORACLE_RESPONSE_FORMAT,
+      },
+    });
+    const responseText = response.output_text.trim();
 
-      const responseText = response.output_text.trim();
-
-      if (responseText) {
-        try {
-          return parseOracleResponse(
-            responseText,
-            verifiedKnowledge.length > 0,
-          );
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : "Invalid output";
-          console.warn(`Could not parse the OpenAI response: ${detail}`);
-          continue;
-        }
-      }
-
-      console.warn(
-        [
-          "OpenAI returned no visible text",
-          `status=${response.status}`,
-          `reason=${response.incomplete_details?.reason ?? "none"}`,
-          `output_tokens=${response.usage?.output_tokens ?? "unknown"}`,
-          `reasoning_tokens=${response.usage?.output_tokens_details.reasoning_tokens ?? "unknown"}`,
-        ].join(", "),
+    if (responseText) {
+      return parseOracleResponse(
+        responseText,
+        verifiedKnowledge.length > 0,
+        structuredKnowledge.length > 0,
       );
     }
 
-    throw new Error("OpenAI returned no visible text after retrying.");
+    throw new Error(
+      [
+        "OpenAI returned no visible text",
+        `status=${response.status}`,
+        `reason=${response.incomplete_details?.reason ?? "none"}`,
+      ].join(", "),
+    );
   }
 
   function buildAnswerComponents(
@@ -201,8 +234,20 @@ async function main(): Promise<void> {
   ) {
     return [
       buildFeedbackButtons(answerId, totals),
-      buildVerificationButton(answerId, isVerified),
+      buildModeratorAnswerButtons(answerId, isVerified),
     ];
+  }
+
+  async function isConfiguredModerator(
+    guild: Guild,
+    discordUserId: string,
+  ): Promise<boolean> {
+    const member = await guild.members.fetch({
+      user: discordUserId,
+      force: true,
+    });
+
+    return memberHasModeratorRole(member.roles.cache.keys(), moderatorRoleIds);
   }
 
   async function canUserConfigureOracleChannel(
@@ -489,10 +534,13 @@ async function main(): Promise<void> {
       return;
     }
 
-    let member: GuildMember;
+    let isModerator: boolean;
 
     try {
-      member = await interaction.guild.members.fetch(interaction.user.id);
+      isModerator = await isConfiguredModerator(
+        interaction.guild,
+        interaction.user.id,
+      );
     } catch (error) {
       console.error("Could not check the moderator role:", error);
       await interaction.editReply(
@@ -501,9 +549,7 @@ async function main(): Promise<void> {
       return;
     }
 
-    if (
-      !memberHasModeratorRole(member.roles.cache.keys(), moderatorRoleIds)
-    ) {
+    if (!isModerator) {
       await interaction.editReply(
         "Only members with a configured moderator role can verify answers.",
       );
@@ -563,6 +609,351 @@ async function main(): Promise<void> {
     });
   }
 
+  async function handleAnswerEditButton(
+    interaction: ButtonInteraction,
+    answerId: string,
+  ): Promise<void> {
+    if (!interaction.inCachedGuild()) {
+      await interaction.reply({
+        content: "Answer editing is only available inside a Discord server.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    let isModerator: boolean;
+
+    try {
+      isModerator = await isConfiguredModerator(
+        interaction.guild,
+        interaction.user.id,
+      );
+    } catch (error) {
+      console.error("Could not check the answer editor's moderator role:", error);
+      await interaction.reply({
+        content: "I could not check your moderator role right now.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (!isModerator) {
+      await interaction.reply({
+        content:
+          "Only members with a configured moderator role can edit answers.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    try {
+      const answer = await database.getAnswerForEditing(answerId);
+      await interaction.showModal(
+        buildAnswerEditModal(answerId, answer.answerText),
+      );
+    } catch (error) {
+      logDatabaseError("Could not open answer editor", error);
+      await interaction.reply({
+        content: "I could not load that answer for editing right now.",
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+  }
+
+  async function handleAnswerEditModal(
+    interaction: ModalSubmitInteraction<"cached">,
+    answerId: string,
+  ): Promise<void> {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    let isModerator: boolean;
+
+    try {
+      isModerator = await isConfiguredModerator(
+        interaction.guild,
+        interaction.user.id,
+      );
+    } catch (error) {
+      console.error("Could not check the answer editor's moderator role:", error);
+      await interaction.editReply(
+        "I could not check your moderator role right now.",
+      );
+      return;
+    }
+
+    if (!isModerator) {
+      await interaction.editReply(
+        "Only members with a configured moderator role can edit answers.",
+      );
+      return;
+    }
+
+    if (
+      !interaction.message ||
+      interaction.message.author.id !== client.user?.id
+    ) {
+      await interaction.editReply(
+        "I could not identify the original Karting Oracle answer.",
+      );
+      return;
+    }
+
+    const sourceMessage = interaction.message;
+
+    const editedText = editedAnswerFromModalFields(interaction.fields);
+
+    if (!editedText) {
+      await interaction.editReply("The edited answer cannot be empty.");
+      return;
+    }
+
+    await answerUpdates.run(answerId, async () => {
+      try {
+        const [editedAnswer, totals] = await Promise.all([
+          database.editAnswer(answerId, editedText, interaction.user.id),
+          database.getVoteTotals(answerId),
+        ]);
+        const usedVerifiedKnowledge = sourceMessage.content
+          .split("\n")
+          .some((line) => line.trim() === VERIFIED_KNOWLEDGE_NOTE);
+
+        await sourceMessage.edit({
+          content: renderAnswerContent(editedAnswer.answerText, {
+            isVerified: editedAnswer.isVerified,
+            usedVerifiedKnowledge,
+            messageLimit: DISCORD_MESSAGE_LIMIT,
+          }),
+          components: buildAnswerComponents(
+            answerId,
+            totals,
+            editedAnswer.isVerified,
+          ),
+        });
+
+        await interaction.editReply(
+          "Answer updated and saved to the audit history. It must be verified again before it is trusted knowledge.",
+        );
+      } catch (error) {
+        logDatabaseError("Could not edit answer", error);
+        await interaction.editReply(
+          "I could not save that answer edit. Make sure the text changed and try again.",
+        );
+      }
+    });
+  }
+
+  async function requireModeratorCommand(
+    interaction: ChatInputCommandInteraction<"cached">,
+  ): Promise<boolean> {
+    try {
+      if (
+        await isConfiguredModerator(interaction.guild, interaction.user.id)
+      ) {
+        return true;
+      }
+    } catch (error) {
+      console.error("Could not check the command moderator role:", error);
+      await interaction.reply({
+        content: "I could not check your moderator role right now.",
+        flags: MessageFlags.Ephemeral,
+      });
+      return false;
+    }
+
+    await interaction.reply({
+      content:
+        "Only members with a configured Oracle moderator role can use this command.",
+      flags: MessageFlags.Ephemeral,
+    });
+    return false;
+  }
+
+  async function handleV5OracleCommand(
+    interaction: ChatInputCommandInteraction<"cached">,
+  ): Promise<void> {
+    const group = interaction.options.getSubcommandGroup(false);
+    const subcommand = interaction.options.getSubcommand();
+
+    if (!group && subcommand === ORACLE_RESET_SUBCOMMAND_NAME) {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      try {
+        const deleted = await questionUpdates.run(
+          `${interaction.guildId}:${interaction.user.id}`,
+          () =>
+            database.clearConversation(
+              interaction.guildId,
+              interaction.user.id,
+            ),
+        );
+        await interaction.editReply(
+          deleted > 0
+            ? "Your Karting Oracle conversation context has been cleared."
+            : "You did not have any saved conversation context to clear.",
+        );
+      } catch (error) {
+        logDatabaseError("Could not reset conversation", error);
+        await interaction.editReply(
+          "I could not clear your conversation context right now.",
+        );
+      }
+      return;
+    }
+
+    if (
+      group !== ORACLE_LIMIT_GROUP_NAME &&
+      group !== ORACLE_KNOWLEDGE_GROUP_NAME
+    ) {
+      return;
+    }
+
+    if (!(await requireModeratorCommand(interaction))) {
+      return;
+    }
+
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    try {
+      if (group === ORACLE_LIMIT_GROUP_NAME) {
+        const dailyLimit =
+          subcommand === "daily"
+            ? interaction.options.getInteger("number", true)
+            : null;
+        const savedLimit = await database.setGuildDailyQuestionLimit(
+          interaction.guildId,
+          dailyLimit,
+          interaction.user.id,
+        );
+
+        await interaction.editReply(
+          savedLimit === undefined
+            ? "Daily AI-question limits are now off for this server."
+            : `Non-moderators may now ask ${savedLimit} AI question${savedLimit === 1 ? "" : "s"} per UTC day.`,
+        );
+        return;
+      }
+
+      const rawCategory = interaction.options.getString("category");
+      const category = rawCategory ?? undefined;
+
+      if (category !== undefined && !isKnowledgeCategory(category)) {
+        await interaction.editReply("That knowledge category is invalid.");
+        return;
+      }
+
+      if (subcommand === "add") {
+        if (!category) {
+          await interaction.editReply("A knowledge category is required.");
+          return;
+        }
+
+        const item = await database.createStructuredKnowledge({
+          category,
+          title: interaction.options.getString("title", true).trim(),
+          content: interaction.options.getString("content", true).trim(),
+          url: normalizeOptionalKnowledgeUrl(
+            interaction.options.getString("url"),
+          ),
+          discordModeratorUserId: interaction.user.id,
+        });
+        await interaction.editReply(
+          `Knowledge item added.\n\n${renderKnowledgeItem(item)}`.slice(
+            0,
+            DISCORD_MESSAGE_LIMIT,
+          ),
+        );
+        return;
+      }
+
+      const id = interaction.options.getString("id");
+
+      if (subcommand === "view") {
+        if (id) {
+          const item = await database.getStructuredKnowledge(id);
+          await interaction.editReply(
+            renderKnowledgeItem(item).slice(0, DISCORD_MESSAGE_LIMIT),
+          );
+          return;
+        }
+
+        const items = await database.listStructuredKnowledge(category, 10);
+        const summary = items
+          .map(
+            (item) =>
+              `${item.isActive === false ? "⚫" : "🟢"} **${item.title}** — ${KNOWLEDGE_CATEGORY_LABELS[item.category]}\n\`${item.id}\``,
+          )
+          .join("\n\n");
+        await interaction.editReply(
+          summary || "No structured knowledge items matched.",
+        );
+        return;
+      }
+
+      if (!id) {
+        await interaction.editReply("A knowledge item ID is required.");
+        return;
+      }
+
+      if (subcommand === "deactivate") {
+        const item = await database.deactivateStructuredKnowledge(
+          id,
+          interaction.user.id,
+        );
+        await interaction.editReply(
+          `Knowledge item deactivated.\n\n${renderKnowledgeItem(item)}`.slice(
+            0,
+            DISCORD_MESSAGE_LIMIT,
+          ),
+        );
+        return;
+      }
+
+      if (subcommand === "edit") {
+        const changes: UpdateStructuredKnowledgeInput = {};
+        const title = interaction.options.getString("title");
+        const content = interaction.options.getString("content");
+        const rawUrl = interaction.options.getString("url");
+
+        if (title !== null) changes.title = title.trim();
+        if (content !== null) changes.content = content.trim();
+        if (category !== undefined) changes.category = category;
+        if (rawUrl !== null) {
+          changes.url = normalizeOptionalKnowledgeUrl(rawUrl) ?? null;
+        }
+
+        if (Object.keys(changes).length === 0) {
+          await interaction.editReply("Provide at least one field to change.");
+          return;
+        }
+
+        const item = await database.updateStructuredKnowledge(
+          id,
+          changes,
+          interaction.user.id,
+        );
+        await interaction.editReply(
+          `Knowledge item updated.\n\n${renderKnowledgeItem(item)}`.slice(
+            0,
+            DISCORD_MESSAGE_LIMIT,
+          ),
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      const isValidationError = detail.includes("URL");
+
+      if (!isValidationError) {
+        logDatabaseError("Oracle command failed", error);
+      }
+
+      await interaction.editReply(
+        isValidationError
+          ? detail
+          : "I could not complete that Oracle command right now.",
+      );
+    }
+  }
+
   client.on(Events.InteractionCreate, (interaction) => {
     if (!interaction.isButton()) {
       return;
@@ -597,6 +988,17 @@ async function main(): Promise<void> {
       return;
     }
 
+    const answerEditId = answerEditIdFromCustomId(interaction.customId);
+
+    if (answerEditId) {
+      void handleAnswerEditButton(interaction, answerEditId).catch(
+        (error: unknown) => {
+          console.error("Could not open answer editing:", error);
+        },
+      );
+      return;
+    }
+
     const verificationButton = verificationButtonFromCustomId(
       interaction.customId,
     );
@@ -624,6 +1026,50 @@ async function main(): Promise<void> {
       void sendError.catch((replyError: unknown) => {
         console.error("Could not send the verification error message:", replyError);
       });
+    });
+  });
+
+  client.on(Events.InteractionCreate, (interaction) => {
+    if (!interaction.isModalSubmit() || !interaction.inCachedGuild()) {
+      return;
+    }
+
+    const answerId = answerEditIdFromCustomId(interaction.customId);
+
+    if (!answerId) {
+      return;
+    }
+
+    void handleAnswerEditModal(interaction, answerId).catch(
+      (error: unknown) => {
+        console.error("Could not handle answer editing:", error);
+      },
+    );
+  });
+
+  client.on(Events.InteractionCreate, (interaction) => {
+    if (
+      !interaction.isChatInputCommand() ||
+      interaction.commandName !== ORACLE_COMMAND_NAME ||
+      !interaction.inCachedGuild()
+    ) {
+      return;
+    }
+
+    const group = interaction.options.getSubcommandGroup(false);
+    const subcommand = interaction.options.getSubcommand(false);
+    const isReset =
+      group === null && subcommand === ORACLE_RESET_SUBCOMMAND_NAME;
+    const isModeratorCommand =
+      group === ORACLE_LIMIT_GROUP_NAME ||
+      group === ORACLE_KNOWLEDGE_GROUP_NAME;
+
+    if (!isReset && !isModeratorCommand) {
+      return;
+    }
+
+    void handleV5OracleCommand(interaction).catch((error: unknown) => {
+      console.error("Could not handle the V5 Oracle command:", error);
     });
   });
 
@@ -841,19 +1287,8 @@ async function main(): Promise<void> {
     });
   });
 
-  client.on(Events.MessageCreate, async (message) => {
+  async function handleOracleMessage(message: Message<true>): Promise<void> {
     const prompt = message.content.trim();
-
-    if (message.author.bot || !message.inGuild() || prompt.length === 0) {
-      return;
-    }
-
-    const oracleChannelId = channelConfig.get(message.guildId);
-
-    if (!oracleChannelId || message.channelId !== oracleChannelId) {
-      return;
-    }
-
     const sendFailure = async (content: string): Promise<void> => {
       await message
         .reply({
@@ -866,51 +1301,157 @@ async function main(): Promise<void> {
         });
     };
 
-    let questionId: string;
+    let history: ConversationMessage[];
 
     try {
-      questionId = await database.saveQuestion({
-        discordMessageId: message.id,
-        discordUserId: message.author.id,
-        questionText: prompt,
-      });
+      const storedHistory = await database.getConversationHistory(
+        message.guildId,
+        message.author.id,
+        conversationLimits.maxMessages * 2,
+      );
+      history = selectConversationContext(
+        storedHistory,
+        message.guildId,
+        message.author.id,
+        conversationLimits,
+      );
     } catch (error) {
-      logDatabaseError("Could not save the Discord question", error);
+      logDatabaseError("Could not load conversation history", error);
       await sendFailure(
-        "Sorry, I could not save your question right now. Please try again in a moment.",
+        "Sorry, I could not load your conversation context right now. Please try again in a moment.",
       );
       return;
     }
+
+    const [verifiedKnowledge, structuredKnowledge] = await Promise.all([
+      database.searchVerifiedKnowledge(prompt, 3).catch((error: unknown) => {
+        logDatabaseError(
+          "Verified knowledge search failed; answering without it",
+          error,
+        );
+        return [] as VerifiedKnowledge[];
+      }),
+      database.searchStructuredKnowledge(prompt, 4).catch((error: unknown) => {
+        logDatabaseError(
+          "Structured knowledge search failed; answering without it",
+          error,
+        );
+        return [];
+      }),
+    ]);
+
+    const topic = classifyTopic(
+      prompt,
+      history.length > 0,
+      verifiedKnowledge.length > 0 || structuredKnowledge.length > 0,
+    );
+
+    if (topic === "obviously_off_topic") {
+      await sendFailure(OFF_TOPIC_RESPONSE);
+      return;
+    }
+
+    let isModerator: boolean;
+
+    try {
+      isModerator = await isConfiguredModerator(
+        message.guild,
+        message.author.id,
+      );
+    } catch (error) {
+      console.error("Could not check the question author's moderator role:", error);
+      await sendFailure(
+        "Sorry, I could not check your question allowance right now. Please try again.",
+      );
+      return;
+    }
+
+    let reservation: DailyQuestionReservation | undefined;
+
+    if (!isModerator) {
+      try {
+        reservation = await database.reserveDailyQuestion(
+          message.guildId,
+          message.author.id,
+        );
+      } catch (error) {
+        logDatabaseError("Could not check the daily question allowance", error);
+        await sendFailure(
+          "Sorry, I could not check your daily question allowance right now. Please try again.",
+        );
+        return;
+      }
+
+      if (!reservation.allowed) {
+        await sendFailure(limitReachedMessage(reservation.dailyLimit ?? 0));
+        return;
+      }
+    }
+
+    const releaseReservation = async (): Promise<void> => {
+      if (reservation?.dailyLimit === undefined || !reservation.allowed) {
+        return;
+      }
+
+      try {
+        await database.releaseDailyQuestion(
+          message.guildId,
+          message.author.id,
+        );
+      } catch (error) {
+        logDatabaseError("Could not release daily question reservation", error);
+      }
+    };
 
     await message.channel.sendTyping().catch((error: unknown) => {
       const detail = error instanceof Error ? error.message : "Unknown error";
       console.error(`Could not send the typing indicator: ${detail}`);
     });
 
-    let verifiedKnowledge: VerifiedKnowledge[] = [];
-
-    try {
-      verifiedKnowledge = await database.searchVerifiedKnowledge(prompt, 3);
-    } catch (error) {
-      logDatabaseError(
-        "Verified knowledge search failed; answering without it",
-        error,
-      );
-    }
-
     let oracleAnswer: OracleAnswer;
 
     try {
-      oracleAnswer = await generateOracleAnswer(prompt, verifiedKnowledge);
+      oracleAnswer = await generateOracleAnswer(
+        prompt,
+        verifiedKnowledge,
+        structuredKnowledge,
+        history,
+      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown error";
       console.error(`Failed to get an OpenAI response: ${detail}`);
+      await releaseReservation();
       await sendFailure("Sorry, I could not get an AI response right now.");
+      return;
+    }
+
+    if (!oracleAnswer.isKartingRelated) {
+      await releaseReservation();
+      await sendFailure(OFF_TOPIC_RESPONSE);
+      return;
+    }
+
+    let questionId: string;
+
+    try {
+      questionId = await database.saveQuestion({
+        discordMessageId: message.id,
+        discordGuildId: message.guildId,
+        discordUserId: message.author.id,
+        questionText: prompt,
+      });
+    } catch (error) {
+      logDatabaseError("Could not save the Discord question", error);
+      await releaseReservation();
+      await sendFailure(
+        "Sorry, I could not save your question right now. Please try again in a moment.",
+      );
       return;
     }
 
     const answerId = randomUUID();
     let totals: VoteTotals;
+    let conversationSaved = false;
 
     try {
       await database.createAnswer({
@@ -919,38 +1460,98 @@ async function main(): Promise<void> {
         answerText: oracleAnswer.text,
       });
       totals = await database.getVoteTotals(answerId);
+      await database.appendConversationExchange({
+        discordGuildId: message.guildId,
+        discordUserId: message.author.id,
+        questionId,
+        answerId,
+        questionText: prompt,
+        answerText: oracleAnswer.text,
+      });
+      conversationSaved = true;
     } catch (error) {
       logDatabaseError("Could not save the AI answer", error);
       await database.deleteAnswer(answerId).catch((rollbackError: unknown) => {
         logDatabaseError("Could not roll back the unsent AI answer", rollbackError);
       });
+      await releaseReservation();
       await sendFailure(
         "Sorry, I generated an answer but could not save it. Please try again in a moment.",
       );
       return;
     }
 
+    let answerContent = renderAnswerContent(oracleAnswer.text, {
+      isVerified: false,
+      usedVerifiedKnowledge: oracleAnswer.usedVerifiedKnowledge,
+      messageLimit: DISCORD_MESSAGE_LIMIT,
+    });
+    const remainingNotice = reservation
+      ? formatRemainingQuestions(reservation)
+      : undefined;
+
+    if (remainingNotice) {
+      const maximumAnswerLength =
+        DISCORD_MESSAGE_LIMIT - remainingNotice.length - 2;
+      answerContent = `${answerContent.slice(0, maximumAnswerLength).trimEnd()}\n\n${remainingNotice}`;
+    }
+
     const discordReply = await message
       .reply({
-        content: renderAnswerContent(oracleAnswer.text, {
-          isVerified: false,
-          usedVerifiedKnowledge: oracleAnswer.usedVerifiedKnowledge,
-          messageLimit: DISCORD_MESSAGE_LIMIT,
-        }),
+        content: answerContent,
         components: buildAnswerComponents(answerId, totals, false),
         allowedMentions: { parse: [], repliedUser: false },
       })
       .catch(async (error: unknown) => {
         const detail = error instanceof Error ? error.message : "Unknown error";
         console.error(`Failed to send the Discord answer: ${detail}`);
+        if (conversationSaved) {
+          await database
+            .deleteConversationExchange(questionId, answerId)
+            .catch((rollbackError: unknown) => {
+              logDatabaseError(
+                "Could not roll back the unsent conversation exchange",
+                rollbackError,
+              );
+            });
+        }
         await database.deleteAnswer(answerId).catch((rollbackError: unknown) => {
           logDatabaseError("Could not roll back the unsent AI answer", rollbackError);
         });
+        await releaseReservation();
         return undefined;
       });
 
     if (!discordReply) {
       return;
+    }
+
+    if (reservation?.dailyLimit !== undefined && reservation.allowed) {
+      let completionError: unknown;
+
+      for (const retryDelay of [0, 250, 1_000]) {
+        if (retryDelay > 0) {
+          await wait(retryDelay);
+        }
+
+        try {
+          await database.completeDailyQuestion(
+            message.guildId,
+            message.author.id,
+          );
+          completionError = undefined;
+          break;
+        } catch (error) {
+          completionError = error;
+        }
+      }
+
+      if (completionError) {
+        logDatabaseError(
+          "Could not finalize successful daily question usage",
+          completionError,
+        );
+      }
     }
 
     let attachmentError: unknown;
@@ -975,6 +1576,28 @@ async function main(): Promise<void> {
         attachmentError,
       );
     }
+  }
+
+  client.on(Events.MessageCreate, (message) => {
+    const prompt = message.content.trim();
+
+    if (message.author.bot || !message.inGuild() || prompt.length === 0) {
+      return;
+    }
+
+    const oracleChannelId = channelConfig.get(message.guildId);
+
+    if (!oracleChannelId || message.channelId !== oracleChannelId) {
+      return;
+    }
+
+    void questionUpdates
+      .run(`${message.guildId}:${message.author.id}`, () =>
+        handleOracleMessage(message),
+      )
+      .catch((error: unknown) => {
+        console.error("Could not process the Oracle question:", error);
+      });
   });
 
   await client.login(discordToken);

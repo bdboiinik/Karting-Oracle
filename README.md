@@ -1,6 +1,15 @@
-# Karting Oracle Bot V4
+# Karting Oracle Bot V5
 
-A Discord bot built with Node.js, TypeScript, `discord.js`, the OpenAI Responses API, and Supabase. Each server chooses one Oracle channel in Discord. Questions, AI answers, votes, moderator verification, and verified community knowledge are persisted in Supabase.
+A Discord bot built with Node.js, TypeScript, `discord.js`, the OpenAI Responses API, and Supabase. Each server chooses one Oracle channel in Discord. V5 persists isolated per-user conversations, daily usage, structured knowledge, questions, answers, edits, votes, moderator verification, and verified community knowledge.
+
+V5 adds:
+
+- Conversation continuity isolated by Discord guild and user, with `/oracle reset`.
+- Configurable, token-bounded recent conversation context.
+- Moderator-controlled daily question limits for non-moderators.
+- Moderator-managed authoritative structured karting knowledge.
+- Audited answer editing through a Discord modal.
+- Karting-only topic enforcement and more comprehensive answers.
 
 V4 keeps V3 voting behavior and adds:
 
@@ -16,7 +25,7 @@ Unverified answers are never used as trusted knowledge, regardless of their vote
 - Node.js 22 or newer
 - A Discord application with a bot token
 - An OpenAI API key with available credit
-- A Supabase project with the V3 schema
+- A Supabase project with the V3 and V4 migrations
 - A Discord role whose members are allowed to verify answers
 
 ## Discord setup
@@ -50,20 +59,18 @@ MODERATOR_ROLE_IDS=123456789,987654321,555555555
 
 Whitespace around IDs and empty entries are ignored. A member is a moderator if they have any one of the configured roles. The verification button is visible on bot answers so moderators can use it. Permission is not based on visibility: every click is checked by the running bot against all configured role IDs before any database update occurs.
 
-## Supabase setup and V4 migration
+## Supabase setup and V5 migration
 
-### Existing V3 project
+### Existing V4 project
 
 1. Sign in at [Supabase](https://supabase.com/dashboard) and open the existing project.
 2. Open **SQL Editor** and select **New query**.
-3. Open [`supabase/migrations/20260826010000_add_oracle_v4_verification.sql`](supabase/migrations/20260826010000_add_oracle_v4_verification.sql).
+3. Open [`supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql`](supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql).
 4. Copy the entire file into the Supabase query and select **Run**.
-5. Open **Table Editor > answers** and confirm these columns exist:
-   - `is_verified`
-   - `verified_by_discord_user_id`
-   - `verified_at`
+5. Confirm these new tables exist: `conversation_messages`, `guild_question_limits`, `daily_question_usage`, `structured_knowledge`, and `answer_edit_history`.
+6. Open **Table Editor > answers** and confirm `original_answer_text`, `edited_by_discord_user_id`, and `edited_at` exist.
 
-The V4 migration is safe to run again if a previous attempt was interrupted.
+The V5 migration is additive and safe to run again if a previous attempt was interrupted. It preserves all existing questions, answers, votes, and verification data. Daily limits reset at 00:00 UTC.
 
 ### New Supabase project
 
@@ -71,6 +78,7 @@ Run these files in order in the SQL Editor:
 
 1. [`supabase/migrations/20260826000000_create_oracle_v3_schema.sql`](supabase/migrations/20260826000000_create_oracle_v3_schema.sql)
 2. [`supabase/migrations/20260826010000_add_oracle_v4_verification.sql`](supabase/migrations/20260826010000_add_oracle_v4_verification.sql)
+3. [`supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql`](supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql)
 
 The V4 migration adds service-role-only database functions for verification and verified knowledge search. Row Level Security remains enabled, and `anon` and `authenticated` users are not granted access. Never paste the Secret/service-role key into Discord, source files, `.env.example`, screenshots, or logs.
 
@@ -82,7 +90,7 @@ Create `.env` from the example if it does not already exist:
 Copy-Item .env.example .env
 ```
 
-Fill in all five values in `.env`:
+Fill in the five required values. The two conversation limits are optional and shown with their defaults:
 
 ```dotenv
 DISCORD_TOKEN=your_discord_bot_token
@@ -90,6 +98,8 @@ OPENAI_API_KEY=your_openai_api_key
 SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=sb_secret_your_backend_secret_key
 MODERATOR_ROLE_IDS=123456789,987654321,555555555
+ORACLE_HISTORY_MAX_MESSAGES=10
+ORACLE_HISTORY_TOKEN_BUDGET=1600
 ```
 
 Where to find them:
@@ -99,6 +109,8 @@ Where to find them:
 - `SUPABASE_URL`: Supabase project **Connect** dialog or **Integrations > Data API**. The base project URL and the displayed `/rest/v1/` URL are both accepted.
 - `SUPABASE_SERVICE_ROLE_KEY`: Supabase **Settings > API Keys**, backend Secret key beginning with `sb_secret_`; a legacy `service_role` key also works.
 - `MODERATOR_ROLE_IDS`: one or more numeric Discord role IDs copied using Developer Mode, separated by commas.
+- `ORACLE_HISTORY_MAX_MESSAGES`: maximum recent messages supplied to OpenAI for one user; allowed range 2–30, default 10.
+- `ORACLE_HISTORY_TOKEN_BUDGET`: approximate maximum tokens for recent conversation context; allowed range 200–8,000, default 1,600.
 
 For backwards compatibility, the bot still accepts the singular `MODERATOR_ROLE_ID` variable when `MODERATOR_ROLE_IDS` is missing or contains no usable IDs. New configurations should use `MODERATOR_ROLE_IDS`.
 
@@ -120,7 +132,26 @@ Supabase persistence is ready.
 Listening in #your-channel on Your Server.
 ```
 
-## How V4 retrieval works
+## How V5 conversation, limits, and knowledge work
+
+Conversation rows are keyed and queried by both `discord_guild_id` and `discord_user_id`. Before OpenAI is called, the bot applies both configured context caps. `/oracle reset` deletes only the invoking user's history in that server.
+
+Configured moderators can use:
+
+```text
+/oracle limit daily number:<number>
+/oracle limit off
+/oracle knowledge add
+/oracle knowledge edit
+/oracle knowledge view
+/oracle knowledge deactivate
+```
+
+Daily limits apply only to non-moderators. A database transaction atomically reserves an allowance before OpenAI is called. The reservation is released when OpenAI fails, the request is rejected as off-topic, persistence fails, or Discord cannot receive the answer. Voting, verification, setup, reset, knowledge commands, and answer editing do not consume allowance.
+
+Structured knowledge supports discount codes, recommended gear, Brad's gear, events/schedules, links, and general karting information. Only active matching entries are supplied to OpenAI as authoritative context. The model is explicitly prohibited from inventing community-specific codes, dates, products, addresses, or URLs.
+
+## Verified-answer retrieval
 
 Before requesting a new OpenAI answer, the bot asks Supabase for at most three full-text matches. The database function filters to `answers.is_verified = true` before returning anything. Matching considers both the earlier question and its answer.
 
@@ -128,7 +159,42 @@ The selected text is supplied privately to OpenAI as trusted supporting context.
 
 If retrieval fails, the failure is logged safely and the bot answers normally without trusted context. Other database failures produce a user-friendly message without crashing the bot or exposing credentials.
 
-## Test V4 in Discord
+## Test V5 in Discord
+
+### Conversation isolation and reset
+
+1. User A asks a karting comparison question and then asks `What about the other one?`; confirm the follow-up uses User A's earlier context.
+2. User B asks the same follow-up without prior context; confirm User A's details do not appear.
+3. User A runs `/oracle reset`, then repeats the follow-up; confirm the previous context is no longer used.
+4. Restart the bot before step 2 or 3 to confirm context persists in Supabase.
+
+### Daily question limit
+
+1. As a configured moderator, run `/oracle limit daily number:2`.
+2. As a non-moderator, ask two valid karting questions and confirm the remaining count is shown.
+3. Ask a third question and confirm it is refused before OpenAI is called.
+4. Restart the bot and confirm the limit and usage remain.
+5. Confirm a configured moderator remains exempt, then run `/oracle limit off`.
+
+### Structured knowledge
+
+1. Run `/oracle knowledge add` and create a distinctive test discount code or gear item.
+2. Use `/oracle knowledge view` to confirm the saved item and ID.
+3. Ask a matching question and confirm the answer uses the exact stored facts without inventing extras.
+4. Run `/oracle knowledge edit` and confirm the changed value is used.
+5. Run `/oracle knowledge deactivate`, ask again, and confirm the inactive item is no longer authoritative context.
+
+### Edit an answer
+
+1. Ask a karting question and click **Edit Answer** as a configured moderator.
+2. Make a small correction in the modal and save it.
+3. Confirm the Discord answer updates and Supabase retains `original_answer_text` plus a row in `answer_edit_history`.
+4. Confirm editing clears verification, then verify the corrected answer and ask a similar question. The corrected text must be retrieved.
+5. Click **Edit Answer** as a non-moderator and confirm only that user receives a denial.
+
+### Off-topic rejection
+
+Ask an obviously unrelated question such as a football score, coding request, or homework problem. Confirm the bot replies briefly that it only helps with karting, creates no answer buttons, and does not consume daily allowance.
 
 ### 1. Verify an answer
 
@@ -174,8 +240,8 @@ Finally, repeat the V3 voting checks: cast Helpful and Not Helpful votes, change
 
 ## Notes
 
-- Each Discord question is sent to OpenAI as a separate request.
+- Accepted questions use one OpenAI request. Obvious off-topic requests are rejected locally without OpenAI.
 - The bot continues to use `gpt-5-mini` and keeps replies within Discord's 2,000-character limit.
 - Messages from other channels, bots, direct messages, and empty messages are ignored.
 - Channel choices remain in the local ignored file `data/guild-config.json`.
-- Questions, answers, votes, and verification metadata live in Supabase.
+- Conversations, limits, usage, structured knowledge, questions, answers, edit history, votes, and verification metadata live in Supabase.
