@@ -69,10 +69,12 @@ import {
 } from "./oracle-channel-setup.js";
 import {
   buildOracleInput,
+  buildWebOracleInput,
   ORACLE_INSTRUCTIONS,
   ORACLE_RESPONSE_FORMAT,
   parseOracleResponse,
   type OracleAnswer,
+  WEB_ORACLE_INSTRUCTIONS,
 } from "./oracle-response.js";
 import {
   isKnowledgeCategory,
@@ -96,6 +98,14 @@ import {
   classifyTopic,
   OFF_TOPIC_RESPONSE,
 } from "./topic-gate.js";
+import {
+  appendWebSourceCitation,
+  createWebCacheKey,
+  parseWebSourcedAnswer,
+  resolveWebRetrievalRequest,
+  webCacheTtlMs,
+  WEB_ORACLE_RESPONSE_FORMAT,
+} from "./web-retrieval.js";
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
 const OPENAI_MODEL = "gpt-5-mini";
@@ -210,21 +220,140 @@ async function main(): Promise<void> {
     });
     const responseText = response.output_text.trim();
 
-    if (responseText) {
-      return parseOracleResponse(
-        responseText,
-        verifiedKnowledge.length > 0,
-        structuredKnowledge.length > 0,
+    if (!responseText) {
+      throw new Error(
+        [
+          "OpenAI returned no visible text",
+          `status=${response.status}`,
+          `reason=${response.incomplete_details?.reason ?? "none"}`,
+        ].join(", "),
       );
     }
 
-    throw new Error(
-      [
-        "OpenAI returned no visible text",
-        `status=${response.status}`,
-        `reason=${response.incomplete_details?.reason ?? "none"}`,
-      ].join(", "),
+    const initialAnswer = parseOracleResponse(
+      responseText,
+      verifiedKnowledge.length > 0,
+      structuredKnowledge.length > 0,
     );
+    const trustedKnowledgeText = [
+      ...structuredKnowledge.flatMap((item) => [
+        item.title,
+        item.content,
+        item.url ?? "",
+      ]),
+      ...verifiedKnowledge.flatMap((item) => [
+        item.questionText,
+        item.answerText,
+      ]),
+    ].join("\n");
+    const webRequest = resolveWebRetrievalRequest(
+      prompt,
+      initialAnswer,
+      trustedKnowledgeText,
+    );
+
+    if (!webRequest) {
+      return initialAnswer;
+    }
+
+    const cacheKey = createWebCacheKey(webRequest.query, webRequest.factType);
+
+    try {
+      const cached = await database.getWebRetrievalCache(cacheKey);
+
+      if (cached) {
+        console.log(`Using cached karting web fact (${cached.factType}).`);
+        return {
+          text: cached.answerText,
+          isKartingRelated: true,
+          usedVerifiedKnowledge: cached.usedVerifiedKnowledge,
+          usedStructuredKnowledge: cached.usedStructuredKnowledge,
+        };
+      }
+    } catch (error) {
+      logDatabaseError(
+        "Web retrieval cache read failed; continuing without cache",
+        error,
+      );
+    }
+
+    try {
+      console.log(`Retrieving targeted karting web fact (${webRequest.factType}).`);
+      const webResponse = await openai.responses.create({
+        model: OPENAI_MODEL,
+        instructions: WEB_ORACLE_INSTRUCTIONS,
+        input: buildWebOracleInput(
+          prompt,
+          webRequest.query,
+          verifiedKnowledge,
+          structuredKnowledge,
+          conversation,
+        ),
+        max_output_tokens: OPENAI_OUTPUT_TOKEN_LIMIT,
+        tools: [{ type: "web_search", search_context_size: "low" }],
+        tool_choice: "required",
+        parallel_tool_calls: false,
+        include: ["web_search_call.action.sources"],
+        text: {
+          format: WEB_ORACLE_RESPONSE_FORMAT,
+        },
+      });
+      const webResponseText = webResponse.output_text.trim();
+
+      if (!webResponseText) {
+        throw new Error("OpenAI web retrieval returned no visible text.");
+      }
+
+      const sourcedAnswer = parseWebSourcedAnswer(
+        webResponseText,
+        webResponse.output,
+        verifiedKnowledge.length > 0,
+        structuredKnowledge.length > 0,
+      );
+      const answerText = appendWebSourceCitation(
+        sourcedAnswer.answerText,
+        sourcedAnswer.source,
+      );
+      const fetchedAt = new Date();
+
+      await database
+        .saveWebRetrievalCache({
+          cacheKey,
+          canonicalQuery: webRequest.query,
+          factType: webRequest.factType,
+          factText: sourcedAnswer.factText,
+          answerText,
+          sources: [sourcedAnswer.source],
+          usedVerifiedKnowledge: sourcedAnswer.usedVerifiedKnowledge,
+          usedStructuredKnowledge: sourcedAnswer.usedStructuredKnowledge,
+          fetchedAt: fetchedAt.toISOString(),
+          expiresAt: new Date(
+            fetchedAt.getTime() + webCacheTtlMs(webRequest.factType),
+          ).toISOString(),
+        })
+        .catch((error: unknown) => {
+          logDatabaseError(
+            "Could not cache the web-retrieved karting fact",
+            error,
+          );
+        });
+
+      return {
+        text: answerText,
+        isKartingRelated: true,
+        usedVerifiedKnowledge: sourcedAnswer.usedVerifiedKnowledge,
+        usedStructuredKnowledge: sourcedAnswer.usedStructuredKnowledge,
+      };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Targeted karting web retrieval failed: ${detail}`);
+      return {
+        text: "I couldn't verify that current information from an official source right now, so I won't guess. Please try again shortly.",
+        isKartingRelated: true,
+        usedVerifiedKnowledge: false,
+        usedStructuredKnowledge: false,
+      };
+    }
   }
 
   function buildAnswerComponents(

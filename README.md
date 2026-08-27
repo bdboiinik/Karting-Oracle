@@ -1,6 +1,6 @@
 # Karting Oracle Bot V5
 
-A Discord bot built with Node.js, TypeScript, `discord.js`, the OpenAI Responses API, and Supabase. Each server chooses one Oracle channel in Discord. V5 persists isolated per-user conversations, daily usage, structured knowledge, questions, answers, edits, votes, moderator verification, and verified community knowledge.
+A Discord bot built with Node.js, TypeScript, `discord.js`, the OpenAI Responses API, and Supabase. Each server chooses one Oracle channel in Discord. V5 persists isolated per-user conversations, daily usage, structured knowledge, questions, answers, edits, votes, moderator verification, verified community knowledge, and an expiring cache of selectively retrieved public karting facts.
 
 V5 adds:
 
@@ -10,6 +10,7 @@ V5 adds:
 - Moderator-managed authoritative structured karting knowledge.
 - Audited answer editing through a Discord modal.
 - Karting-only topic enforcement and more comprehensive answers.
+- Selective OpenAI web retrieval for current or exact karting facts, with validated source links and cost-conscious caching.
 
 V4 keeps V3 voting behavior and adds:
 
@@ -59,7 +60,7 @@ MODERATOR_ROLE_IDS=123456789,987654321,555555555
 
 Whitespace around IDs and empty entries are ignored. A member is a moderator if they have any one of the configured roles. The verification button is visible on bot answers so moderators can use it. Permission is not based on visibility: every click is checked by the running bot against all configured role IDs before any database update occurs.
 
-## Supabase setup and V5 migration
+## Supabase setup and migrations
 
 ### Existing V4 project
 
@@ -72,6 +73,17 @@ Whitespace around IDs and empty entries are ignored. A member is a moderator if 
 
 The V5 migration is additive and safe to run again if a previous attempt was interrupted. It preserves all existing questions, answers, votes, and verification data. Daily limits reset at 00:00 UTC.
 
+### Existing V5 project: web retrieval cache
+
+Before deploying this web-retrieval version:
+
+1. Open **Supabase > SQL Editor > New query**.
+2. Open [`supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql`](supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql).
+3. Copy the entire file into the query and select **Run**.
+4. Confirm **Table Editor** contains `web_retrieval_cache`.
+
+The cache is separate from `structured_knowledge` and verified answers. A cached public-web result never becomes trusted community knowledge automatically. Row Level Security is enabled and only the backend service role is granted table access.
+
 ### New Supabase project
 
 Run these files in order in the SQL Editor:
@@ -79,6 +91,7 @@ Run these files in order in the SQL Editor:
 1. [`supabase/migrations/20260826000000_create_oracle_v3_schema.sql`](supabase/migrations/20260826000000_create_oracle_v3_schema.sql)
 2. [`supabase/migrations/20260826010000_add_oracle_v4_verification.sql`](supabase/migrations/20260826010000_add_oracle_v4_verification.sql)
 3. [`supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql`](supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql)
+4. [`supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql`](supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql)
 
 The V4 migration adds service-role-only database functions for verification and verified knowledge search. Row Level Security remains enabled, and `anon` and `authenticated` users are not granted access. Never paste the Secret/service-role key into Discord, source files, `.env.example`, screenshots, or logs.
 
@@ -158,6 +171,25 @@ Before requesting a new OpenAI answer, the bot asks Supabase for at most three f
 The selected text is supplied privately to OpenAI as trusted supporting context. The model is instructed to synthesise a fresh answer, state uncertainty, and never invent track-specific facts, rules, or regulations. Database IDs, relevance scores, verification metadata, and raw search results are not shown in Discord.
 
 If retrieval fails, the failure is logged safely and the bot answers normally without trusted context. Other database failures produce a user-friendly message without crashing the bot or exposing credentials.
+
+## Selective karting web retrieval
+
+The first OpenAI response remains a karting-only topic and retrieval decision. The web tool is not available during that decision, so an off-topic question cannot trigger a general web search. A second request with one targeted `web_search` tool is made only when a karting answer needs a current or exact public fact that is missing from structured and verified knowledge.
+
+Typical routed facts are circuit addresses and postcodes, official websites, contact details, opening hours, current fleets, current events/schedules, and current products. Ordinary racecraft, setup, and driving advice does not trigger web retrieval. Venue-location questions are specifically routed when trusted knowledge does not already contain a complete address/postcode.
+
+The web prompt prioritises an official circuit, championship, manufacturer, organiser, or retailer source. The selected source URL must also appear in the web tool's returned source metadata or the result is rejected. A validated source link is included in Discord whenever web retrieval contributes the fact.
+
+Results are cached by a normalized fact query. Addresses expire after 180 days, official websites after 90 days, contact information after 30 days, fleets after 7 days, opening hours/current products after 24 hours, and event schedules after 6 hours. An expired or missing cache row causes a fresh lookup; a fresh matching row avoids another paid web search. No additional API key is required because this uses the existing `OPENAI_API_KEY`.
+
+### Test web retrieval in Discord
+
+1. Run the web-cache migration, restart the bot, and ask `Where is Buckmore located?`.
+2. Confirm the first Discord answer includes the complete useful address/postcode and a `📎 Source:` link to the official venue source.
+3. Ask the same question again. Confirm the answer still includes the source; the matching fresh cache row should be reused rather than performing another web search.
+4. Ask an ordinary question such as `How should I improve my braking consistency?` and confirm it answers normally without a source line or a new cache row.
+5. Ask an off-topic current-information question and confirm Karting Oracle rejects it without creating a cache row.
+6. In Supabase **Table Editor > web_retrieval_cache**, inspect the relevant row and confirm `fact_type`, `fetched_at`, and `expires_at` are populated. Do not copy cache rows into verified or structured knowledge unless a moderator deliberately reviews and adds that information through the existing workflow.
 
 ## Test V5 in Discord
 
@@ -240,8 +272,8 @@ Finally, repeat the V3 voting checks: cast Helpful and Not Helpful votes, change
 
 ## Notes
 
-- Accepted questions use one OpenAI request. Obvious off-topic requests are rejected locally without OpenAI.
+- Normal accepted questions use one OpenAI request. A question approved for web retrieval uses one planning response plus one targeted web-enabled response; matching cached facts avoid the paid web lookup. Obvious off-topic requests are rejected locally without OpenAI.
 - The bot continues to use `gpt-5-mini` and keeps replies within Discord's 2,000-character limit.
 - Messages from other channels, bots, direct messages, and empty messages are ignored.
 - Channel choices remain in the local ignored file `data/guild-config.json`.
-- Conversations, limits, usage, structured knowledge, questions, answers, edit history, votes, and verification metadata live in Supabase.
+- Conversations, limits, usage, structured knowledge, questions, answers, edit history, votes, verification metadata, and expiring web-cache rows live in Supabase.

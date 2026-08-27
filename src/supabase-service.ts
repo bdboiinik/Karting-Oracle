@@ -8,6 +8,11 @@ import {
   type KnowledgeCategory,
   type StructuredKnowledge,
 } from "./structured-knowledge.js";
+import {
+  isWebFactType,
+  type WebRetrievalCacheEntry,
+  type WebSource,
+} from "./web-retrieval.js";
 
 interface SupabaseErrorLike {
   code?: string;
@@ -73,6 +78,19 @@ interface EditedAnswerRow {
   is_verified: boolean;
   edited_by_discord_user_id: string;
   edited_at: string;
+}
+
+interface WebRetrievalCacheRow {
+  cache_key: string;
+  canonical_query: string;
+  fact_type: string;
+  fact_text: string;
+  answer_text: string;
+  sources: unknown;
+  used_verified_knowledge: boolean;
+  used_structured_knowledge: boolean;
+  fetched_at: string;
+  expires_at: string;
 }
 
 export interface SaveQuestionInput {
@@ -222,6 +240,67 @@ function parseStructuredKnowledge(
   };
 }
 
+function parseWebSources(value: unknown): WebSource[] {
+  if (!Array.isArray(value)) {
+    throw persistenceError("read web retrieval cache", {
+      code: "INVALID_RESPONSE",
+      message: "Invalid web sources returned by the database.",
+    });
+  }
+
+  return value.map((source) => {
+    if (
+      typeof source !== "object" ||
+      source === null ||
+      !("title" in source) ||
+      !("url" in source) ||
+      typeof source.title !== "string" ||
+      typeof source.url !== "string"
+    ) {
+      throw persistenceError("read web retrieval cache", {
+        code: "INVALID_RESPONSE",
+        message: "Invalid web source returned by the database.",
+      });
+    }
+
+    return { title: source.title, url: source.url };
+  });
+}
+
+function parseWebRetrievalCache(
+  row: WebRetrievalCacheRow,
+): WebRetrievalCacheEntry {
+  if (
+    typeof row.cache_key !== "string" ||
+    typeof row.canonical_query !== "string" ||
+    !isWebFactType(row.fact_type) ||
+    typeof row.fact_text !== "string" ||
+    typeof row.answer_text !== "string" ||
+    typeof row.used_verified_knowledge !== "boolean" ||
+    typeof row.used_structured_knowledge !== "boolean" ||
+    typeof row.fetched_at !== "string" ||
+    typeof row.expires_at !== "string"
+  ) {
+    throw persistenceError("read web retrieval cache", {
+      code: "INVALID_RESPONSE",
+      message: "Invalid web retrieval cache entry returned by the database.",
+    });
+  }
+
+  return {
+    cacheKey: row.cache_key,
+    canonicalQuery: row.canonical_query,
+    factType: row.fact_type,
+    factText: row.fact_text,
+    answerText: row.answer_text,
+    sources: parseWebSources(row.sources),
+    usedVerifiedKnowledge: row.used_verified_knowledge,
+    usedStructuredKnowledge: row.used_structured_knowledge,
+    fetchedAt: row.fetched_at,
+    expiresAt: row.expires_at,
+  };
+}
+
 function normalizeSupabaseUrl(value: string): string {
   let url: URL;
 
@@ -276,6 +355,15 @@ export class SupabaseService {
 
     if (error) {
       throw persistenceError("check V5 schema", error);
+    }
+
+    const { error: webCacheError } = await this.client
+      .from("web_retrieval_cache")
+      .select("cache_key")
+      .limit(1);
+
+    if (webCacheError) {
+      throw persistenceError("check web retrieval cache schema", webCacheError);
     }
   }
 
@@ -661,6 +749,51 @@ export class SupabaseService {
     }
 
     return (data as StructuredKnowledgeRow[]).map(parseStructuredKnowledge);
+  }
+
+  async getWebRetrievalCache(
+    cacheKey: string,
+  ): Promise<WebRetrievalCacheEntry | undefined> {
+    const { data, error } = await this.client
+      .from("web_retrieval_cache")
+      .select(
+        "cache_key, canonical_query, fact_type, fact_text, answer_text, sources, used_verified_knowledge, used_structured_knowledge, fetched_at, expires_at",
+      )
+      .eq("cache_key", cacheKey)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+
+    if (error) {
+      throw persistenceError("read web retrieval cache", error);
+    }
+
+    return data
+      ? parseWebRetrievalCache(data as WebRetrievalCacheRow)
+      : undefined;
+  }
+
+  async saveWebRetrievalCache(
+    entry: WebRetrievalCacheEntry,
+  ): Promise<void> {
+    const { error } = await this.client.from("web_retrieval_cache").upsert(
+      {
+        cache_key: entry.cacheKey,
+        canonical_query: entry.canonicalQuery,
+        fact_type: entry.factType,
+        fact_text: entry.factText,
+        answer_text: entry.answerText,
+        sources: entry.sources,
+        used_verified_knowledge: entry.usedVerifiedKnowledge,
+        used_structured_knowledge: entry.usedStructuredKnowledge,
+        fetched_at: entry.fetchedAt,
+        expires_at: entry.expiresAt,
+      },
+      { onConflict: "cache_key" },
+    );
+
+    if (error) {
+      throw persistenceError("save web retrieval cache", error);
+    }
   }
 
   async createStructuredKnowledge(

@@ -1,41 +1,55 @@
 import type { ConversationMessage } from "./conversation-context.js";
 import type { StructuredKnowledge } from "./structured-knowledge.js";
 import type { VerifiedKnowledge } from "./supabase-service.js";
+import {
+  WEB_FACT_TYPES,
+  type WebRetrievalRequest,
+} from "./web-retrieval.js";
 
 export interface OracleAnswer {
   text: string;
   isKartingRelated: boolean;
   usedVerifiedKnowledge: boolean;
   usedStructuredKnowledge: boolean;
+  webRetrievalRequest?: WebRetrievalRequest;
 }
 
 export const ORACLE_RESPONSE_FORMAT = {
   type: "json_schema",
   name: "karting_oracle_answer",
   description:
-    "A concise Discord answer and whether verified community context materially informed it.",
+    "A concise Discord answer and a selective karting-only web retrieval decision.",
   strict: true,
   schema: {
     type: "object",
     properties: {
-      answer: { type: "string" },
+      answer: { type: "string", maxLength: 1800 },
       is_karting_related: { type: "boolean" },
       used_verified_knowledge: { type: "boolean" },
       used_structured_knowledge: { type: "boolean" },
+      requires_web_retrieval: { type: "boolean" },
+      web_search_query: { type: "string", maxLength: 400 },
+      web_fact_type: {
+        type: "string",
+        enum: ["none", ...WEB_FACT_TYPES],
+      },
     },
     required: [
       "answer",
       "is_karting_related",
       "used_verified_knowledge",
       "used_structured_knowledge",
+      "requires_web_retrieval",
+      "web_search_query",
+      "web_fact_type",
     ],
     additionalProperties: false,
   },
 } as const;
 
-export const ORACLE_INSTRUCTIONS = `You are Karting Oracle, a specialist Discord assistant that only answers questions materially related to karting. Allowed subjects include kart driving, racecraft, circuits, kart equipment, karting events, karting organisations, rental karting, owner-driver karting, and supplied Brad/community karting information.
+export const ORACLE_BASE_INSTRUCTIONS = `You are Karting Oracle, a specialist Discord assistant that only answers questions materially related to karting. Allowed subjects include kart driving, racecraft, circuits, kart equipment, karting events, karting organisations, rental karting, owner-driver karting, and supplied Brad/community karting information.
 
-For unrelated general-purpose requests, set is_karting_related to false and answer only: 🏁 I'm Karting Oracle — I can only help with karting-related questions. A request that connects outside information meaningfully to karting can be answered, but never imply access to live/current information that was not supplied. For a karting request, set is_karting_related to true.
+For unrelated general-purpose requests, set is_karting_related to false and answer only: 🏁 I'm Karting Oracle — I can only help with karting-related questions. A request that connects outside information meaningfully to karting can be answered. For a karting request, set is_karting_related to true.
 
 Answer clearly and keep the answer field under 1,800 characters. Be concise but comprehensive enough to include obvious useful information already known from authoritative context, rather than routinely inviting another question. For example, provide a complete known track address rather than only its town. Do not routinely end with "Would you like me to..." or similar offers. Ask a clarifying question only when accuracy genuinely requires missing information.
 
@@ -48,6 +62,20 @@ Recent conversation contains only this Discord user's prior messages in this ser
 Clearly acknowledge uncertainty. Never invent track-specific facts, class rules, technical regulations, safety requirements, or legal requirements. If the supplied context does not establish a requested track-specific fact or rule, say that it should be checked against the track, championship, organiser, or official rulebook.
 
 Format the answer for Discord using short paragraphs and readable spacing. When it needs multiple sections, use bold alphabetic headings such as **A. Driving technique**, **B. Kart setup**, and **C. Fitness**. Under each heading, use subpoints written as 1), 2), 3), restarting at 1) for each new section. Never use Markdown numbered-list syntax such as 1. or 2. because Discord may renumber nested lists incorrectly. Do not force a list when a short paragraph is clearer.`;
+
+export const ORACLE_INSTRUCTIONS = `${ORACLE_BASE_INSTRUCTIONS}
+
+No web tool is available in this planning response. Set requires_web_retrieval to true only when the question is karting-related and answering it accurately requires a current or exact public fact that is not sufficiently established by the supplied structured or verified knowledge. Suitable facts include venue addresses/postcodes, official websites, contact details, opening hours, current fleets, current events/schedules, and current products. Do not request web retrieval for ordinary driving, setup, racecraft, or general advice.
+
+For a karting venue location question, if the supplied structured or verified knowledge does not contain a sufficiently complete address and postcode, set requires_web_retrieval to true even if you know the approximate town. The first user-facing answer must contain the complete useful location when an official source can establish it.
+
+Web retrieval must never be requested for an off-topic question. If requires_web_retrieval is true, provide a short canonical web_search_query focused on the named karting entity and requested fact, prefer an official first-party source, and select the matching web_fact_type. Otherwise use an empty web_search_query and web_fact_type "none".`;
+
+export const WEB_ORACLE_INSTRUCTIONS = `${ORACLE_BASE_INSTRUCTIONS}
+
+This request has already passed the karting-only topic check and has been approved for one targeted web lookup. Use the web search tool to answer the exact current factual request. Prefer the named circuit, championship, manufacturer, organiser, or retailer's official first-party website. Use one authoritative source when it is sufficient. Do not broaden the search into an unrelated topic, do not invent missing facts, and clearly say if the requested fact cannot be verified.
+
+Put the complete useful fact in the answer immediately. For a venue location, include the full official address and postcode when available. fact_summary must contain only the reusable factual result, not conversational wording. primary_source_url and primary_source_title must identify the first-party source actually consulted. Do not add a Sources section to answer; the application adds the validated link.`;
 
 export function buildOracleInput(
   question: string,
@@ -97,6 +125,21 @@ export function buildOracleInput(
   return `${sections.join("\n\n")}\n\nCurrent user question:\n${question}`;
 }
 
+export function buildWebOracleInput(
+  question: string,
+  searchQuery: string,
+  verifiedKnowledge: VerifiedKnowledge[],
+  structuredKnowledge: StructuredKnowledge[] = [],
+  conversation: ConversationMessage[] = [],
+): string {
+  return `${buildOracleInput(
+    question,
+    verifiedKnowledge,
+    structuredKnowledge,
+    conversation,
+  )}\n\nApproved targeted web query:\n${searchQuery}`;
+}
+
 export function parseOracleResponse(
   outputText: string,
   verifiedKnowledgeWasAvailable: boolean,
@@ -110,38 +153,50 @@ export function parseOracleResponse(
     throw new Error("OpenAI returned an invalid structured response.");
   }
 
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("answer" in value) ||
-    !("is_karting_related" in value) ||
-    !("used_verified_knowledge" in value) ||
-    !("used_structured_knowledge" in value)
-  ) {
-    throw new Error("OpenAI returned an incomplete structured response.");
+  if (typeof value !== "object" || value === null) {
+    throw new Error("OpenAI returned an invalid structured response.");
   }
 
-  const answer = value.answer;
-  const isKartingRelated = value.is_karting_related;
-  const usedVerifiedKnowledge = value.used_verified_knowledge;
-  const usedStructuredKnowledge = value.used_structured_knowledge;
+  const row = value as Record<string, unknown>;
+  const requiresWebRetrieval = row.requires_web_retrieval;
+  const webSearchQuery = row.web_search_query;
+  const webFactType = row.web_fact_type;
 
   if (
-    typeof answer !== "string" ||
-    answer.trim().length === 0 ||
-    typeof isKartingRelated !== "boolean" ||
-    typeof usedVerifiedKnowledge !== "boolean" ||
-    typeof usedStructuredKnowledge !== "boolean"
+    typeof row.answer !== "string" ||
+    row.answer.trim().length === 0 ||
+    typeof row.is_karting_related !== "boolean" ||
+    typeof row.used_verified_knowledge !== "boolean" ||
+    typeof row.used_structured_knowledge !== "boolean" ||
+    typeof requiresWebRetrieval !== "boolean" ||
+    typeof webSearchQuery !== "string" ||
+    webSearchQuery.length > 400 ||
+    typeof webFactType !== "string" ||
+    (requiresWebRetrieval &&
+      (webSearchQuery.trim().length === 0 ||
+        !WEB_FACT_TYPES.includes(
+          webFactType as (typeof WEB_FACT_TYPES)[number],
+        ))) ||
+    (!requiresWebRetrieval && webFactType !== "none")
   ) {
     throw new Error("OpenAI returned an invalid structured response.");
   }
 
+  const webRetrievalRequest =
+    row.is_karting_related && requiresWebRetrieval
+      ? {
+          query: webSearchQuery.trim(),
+          factType: webFactType as (typeof WEB_FACT_TYPES)[number],
+        }
+      : undefined;
+
   return {
-    text: answer.trim(),
-    isKartingRelated,
+    text: row.answer.trim(),
+    isKartingRelated: row.is_karting_related,
     usedVerifiedKnowledge:
-      verifiedKnowledgeWasAvailable && usedVerifiedKnowledge,
+      verifiedKnowledgeWasAvailable && row.used_verified_knowledge,
     usedStructuredKnowledge:
-      structuredKnowledgeWasAvailable && usedStructuredKnowledge,
+      structuredKnowledgeWasAvailable && row.used_structured_knowledge,
+    ...(webRetrievalRequest ? { webRetrievalRequest } : {}),
   };
 }

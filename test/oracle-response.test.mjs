@@ -65,6 +65,9 @@ test("does not claim verified knowledge was used when none was available", () =>
       is_karting_related: true,
       used_verified_knowledge: true,
       used_structured_knowledge: false,
+      requires_web_retrieval: false,
+      web_search_query: "",
+      web_fact_type: "none",
     }),
     false,
   );
@@ -74,6 +77,26 @@ test("does not claim verified knowledge was used when none was available", () =>
     isKartingRelated: true,
     usedVerifiedKnowledge: false,
     usedStructuredKnowledge: false,
+  });
+});
+
+test("returns a targeted karting web retrieval request", () => {
+  const parsed = parseOracleResponse(
+    JSON.stringify({
+      answer: "I need to verify the complete venue address.",
+      is_karting_related: true,
+      used_verified_knowledge: false,
+      used_structured_knowledge: false,
+      requires_web_retrieval: true,
+      web_search_query: "Buckmore Park official address postcode",
+      web_fact_type: "location_address",
+    }),
+    false,
+  );
+
+  assert.deepEqual(parsed.webRetrievalRequest, {
+    query: "Buckmore Park official address postcode",
+    factType: "location_address",
   });
 });
 
