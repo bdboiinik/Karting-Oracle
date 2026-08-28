@@ -1,3 +1,5 @@
+import { condenseAnswerForDiscord } from "./answer-length.js";
+
 export const VERIFIED_ANSWER_BADGE = "✅ **Verified by a moderator**";
 export const VERIFIED_KNOWLEDGE_NOTE =
   "📚 Informed by verified community knowledge";
@@ -18,18 +20,6 @@ function removePresentationLines(content: string): string {
     )
     .join("\n")
     .trim();
-}
-
-function truncate(content: string, limit: number): string {
-  if (content.length <= limit) {
-    return content;
-  }
-
-  if (limit <= 3) {
-    return ".".repeat(Math.max(0, limit));
-  }
-
-  return `${content.slice(0, limit - 3).trimEnd()}...`;
 }
 
 export function renderAnswerContent(
@@ -54,7 +44,10 @@ export function renderAnswerContent(
     messageLimit - separator.length - suffix.length,
   );
   const cleanAnswer = removePresentationLines(answerText);
-  const displayedAnswer = truncate(cleanAnswer, availableAnswerLength);
+  const displayedAnswer = condenseAnswerForDiscord(
+    cleanAnswer,
+    availableAnswerLength,
+  );
 
   return `${displayedAnswer}${separator}${suffix}`;
 }

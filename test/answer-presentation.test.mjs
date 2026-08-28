@@ -39,6 +39,7 @@ test("status indicators fit inside Discord's message limit", () => {
     usedVerifiedKnowledge: true,
   });
 
-  assert.equal(content.length, 2_000);
+  assert.ok(content.length <= 2_000);
+  assert.ok(!content.includes("..."));
   assert.ok(content.endsWith(VERIFIED_KNOWLEDGE_NOTE));
 });

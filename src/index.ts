@@ -17,6 +17,7 @@ import {
   type TextChannel,
 } from "discord.js";
 import OpenAI from "openai";
+import type { ResponseCreateParamsNonStreaming } from "openai/resources/responses/responses";
 
 import {
   renderAnswerContent,
@@ -82,6 +83,7 @@ import {
   normalizeOptionalKnowledgeUrl,
   renderKnowledgeItem,
 } from "./structured-knowledge.js";
+import { safeErrorDetails } from "./safe-diagnostics.js";
 import {
   isMissingAnswerError,
   SupabasePersistenceError,
@@ -101,6 +103,7 @@ import {
 import {
   appendWebSourceCitation,
   createWebCacheKey,
+  getWebSearchDiagnostics,
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
@@ -109,7 +112,9 @@ import {
 
 const DISCORD_MESSAGE_LIMIT = 2_000;
 const OPENAI_MODEL = "gpt-5-mini";
-const OPENAI_OUTPUT_TOKEN_LIMIT = 2_500;
+const OPENAI_PLANNING_OUTPUT_TOKEN_LIMIT = 2_000;
+const OPENAI_WEB_OUTPUT_TOKEN_LIMIT = 2_500;
+const OPENAI_MAX_WEB_TOOL_CALLS = 3;
 const CHANNEL_CONFIG_PATH = fileURLToPath(
   new URL("../data/guild-config.json", import.meta.url),
 );
@@ -213,9 +218,10 @@ async function main(): Promise<void> {
         structuredKnowledge,
         conversation,
       ),
-      max_output_tokens: OPENAI_OUTPUT_TOKEN_LIMIT,
+      max_output_tokens: OPENAI_PLANNING_OUTPUT_TOKEN_LIMIT,
       text: {
         format: ORACLE_RESPONSE_FORMAT,
+        verbosity: "low",
       },
     });
     const responseText = response.output_text.trim();
@@ -226,6 +232,7 @@ async function main(): Promise<void> {
           "OpenAI returned no visible text",
           `status=${response.status}`,
           `reason=${response.incomplete_details?.reason ?? "none"}`,
+          `error=${response.error ? safeErrorDetails(response.error) : "none"}`,
         ].join(", "),
       );
     }
@@ -257,12 +264,17 @@ async function main(): Promise<void> {
     }
 
     const cacheKey = createWebCacheKey(webRequest.query, webRequest.factType);
+    console.log(
+      `[web-search] required=true fact_type=${webRequest.factType} cache_key=${cacheKey.slice(0, 12)}`,
+    );
 
     try {
       const cached = await database.getWebRetrievalCache(cacheKey);
 
       if (cached) {
-        console.log(`Using cached karting web fact (${cached.factType}).`);
+        console.log(
+          `[web-search] cache_hit=true tool_invoked=false fact_type=${cached.factType}`,
+        );
         return {
           text: cached.answerText,
           isKartingRelated: true,
@@ -278,8 +290,12 @@ async function main(): Promise<void> {
     }
 
     try {
-      console.log(`Retrieving targeted karting web fact (${webRequest.factType}).`);
-      const webResponse = await openai.responses.create({
+      console.log(
+        `[web-search] cache_hit=false request_started=true fact_type=${webRequest.factType}`,
+      );
+      const webResponseRequest: ResponseCreateParamsNonStreaming & {
+        max_tool_calls: number;
+      } = {
         model: OPENAI_MODEL,
         instructions: WEB_ORACLE_INSTRUCTIONS,
         input: buildWebOracleInput(
@@ -289,19 +305,34 @@ async function main(): Promise<void> {
           structuredKnowledge,
           conversation,
         ),
-        max_output_tokens: OPENAI_OUTPUT_TOKEN_LIMIT,
+        max_output_tokens: OPENAI_WEB_OUTPUT_TOKEN_LIMIT,
+        max_tool_calls: OPENAI_MAX_WEB_TOOL_CALLS,
         tools: [{ type: "web_search", search_context_size: "low" }],
         tool_choice: "required",
         parallel_tool_calls: false,
         include: ["web_search_call.action.sources"],
         text: {
           format: WEB_ORACLE_RESPONSE_FORMAT,
+          verbosity: "low",
         },
-      });
+      };
+      const webResponse = await openai.responses.create(webResponseRequest);
+      const webDiagnostics = getWebSearchDiagnostics(webResponse.output);
+      console.log(
+        `[web-search] result=${JSON.stringify({
+          responseStatus: webResponse.status,
+          responseError: webResponse.error
+            ? safeErrorDetails(webResponse.error)
+            : undefined,
+          ...webDiagnostics,
+        })}`,
+      );
       const webResponseText = webResponse.output_text.trim();
 
       if (!webResponseText) {
-        throw new Error("OpenAI web retrieval returned no visible text.");
+        throw new Error(
+          `OpenAI web retrieval returned no visible text (status=${webResponse.status}, reason=${webResponse.incomplete_details?.reason ?? "none"}).`,
+        );
       }
 
       const sourcedAnswer = parseWebSourcedAnswer(
@@ -313,6 +344,9 @@ async function main(): Promise<void> {
       const answerText = appendWebSourceCitation(
         sourcedAnswer.answerText,
         sourcedAnswer.source,
+      );
+      console.log(
+        `[web-search] validation=passed primary_source_domain=${new URL(sourcedAnswer.source.url).hostname}`,
       );
       const fetchedAt = new Date();
 
@@ -345,8 +379,9 @@ async function main(): Promise<void> {
         usedStructuredKnowledge: sourcedAnswer.usedStructuredKnowledge,
       };
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Unknown error";
-      console.error(`Targeted karting web retrieval failed: ${detail}`);
+      console.error(
+        `[web-search] validation_or_request=failed error=${safeErrorDetails(error)}`,
+      );
       return {
         text: "I couldn't verify that current information from an official source right now, so I won't guess. Please try again shortly.",
         isKartingRelated: true,
@@ -1547,8 +1582,9 @@ async function main(): Promise<void> {
         history,
       );
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Unknown error";
-      console.error(`Failed to get an OpenAI response: ${detail}`);
+      console.error(
+        `[openai] answer_generation=failed error=${safeErrorDetails(error)}`,
+      );
       await releaseReservation();
       await sendFailure("Sorry, I could not get an AI response right now.");
       return;

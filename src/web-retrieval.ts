@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
 
+import {
+  condenseAnswerForDiscord,
+  MAX_ORACLE_ANSWER_CHARACTERS,
+} from "./answer-length.js";
+
 export const WEB_FACT_TYPES = [
   "location_address",
   "official_website",
@@ -42,6 +47,18 @@ export interface WebSourcedAnswer {
   source: WebSource;
   usedVerifiedKnowledge: boolean;
   usedStructuredKnowledge: boolean;
+}
+
+export interface WebSearchDiagnostics {
+  triggered: boolean;
+  callCount: number;
+  completedCallCount: number;
+  failedCallCount: number;
+  statuses: string[];
+  actions: string[];
+  sourceCount: number;
+  sourceDomains: string[];
+  sourceUrls: string[];
 }
 
 export const WEB_ORACLE_RESPONSE_FORMAT = {
@@ -197,10 +214,101 @@ function httpUrl(value: unknown): string | undefined {
   }
 }
 
-function sourceUrlsFromOutput(output: readonly unknown[]): Set<string> {
-  const urls = new Set<string>();
+function sourceTitle(url: string, title?: unknown): string {
+  if (typeof title === "string" && title.trim()) return title.trim();
+  return new URL(url).hostname.replace(/^www\./, "");
+}
+
+function canonicalSourceUrl(value: string): string {
+  const url = new URL(value);
+  url.hash = "";
+  url.search = "";
+  url.hostname = url.hostname.toLowerCase();
+  url.pathname = url.pathname.replace(/\/+$/, "") || "/";
+  return url.toString();
+}
+
+function registrableDomain(value: string): string {
+  const hostname = new URL(value).hostname.toLowerCase().replace(/^www\./, "");
+  const parts = hostname.split(".");
+  const countrySecondLevel = new Set([
+    "co.uk",
+    "org.uk",
+    "com.au",
+    "co.nz",
+    "co.za",
+  ]);
+  const finalTwo = parts.slice(-2).join(".");
+
+  return countrySecondLevel.has(finalTwo) && parts.length >= 3
+    ? parts.slice(-3).join(".")
+    : finalTwo;
+}
+
+function equivalentUrl(left: string, right: string): boolean {
+  return canonicalSourceUrl(left) === canonicalSourceUrl(right);
+}
+
+function sameAuthorityDomain(left: string, right: string): boolean {
+  return registrableDomain(left) === registrableDomain(right);
+}
+
+function deduplicateSources(sources: WebSource[]): WebSource[] {
+  const seen = new Set<string>();
+
+  return sources.filter((source) => {
+    const key = canonicalSourceUrl(source.url);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function extractWebSources(output: readonly unknown[]): WebSource[] {
+  const citations: WebSource[] = [];
+  const consulted: WebSource[] = [];
 
   for (const item of output) {
+    if (
+      typeof item === "object" &&
+      item !== null &&
+      "type" in item &&
+      item.type === "message" &&
+      "content" in item &&
+      Array.isArray(item.content)
+    ) {
+      for (const part of item.content) {
+        if (
+          typeof part !== "object" ||
+          part === null ||
+          !("annotations" in part) ||
+          !Array.isArray(part.annotations)
+        ) {
+          continue;
+        }
+
+        for (const annotation of part.annotations) {
+          if (
+            typeof annotation !== "object" ||
+            annotation === null ||
+            !("type" in annotation) ||
+            annotation.type !== "url_citation"
+          ) {
+            continue;
+          }
+
+          const record = annotation as Record<string, unknown>;
+          const url = httpUrl(record.url);
+          if (url) {
+            citations.push({
+              title: sourceTitle(url, record.title),
+              url,
+            });
+          }
+        }
+      }
+    }
+
     if (
       typeof item !== "object" ||
       item === null ||
@@ -215,23 +323,77 @@ function sourceUrlsFromOutput(output: readonly unknown[]): Set<string> {
 
     const action = item.action as Record<string, unknown>;
     const directUrl = httpUrl(action.url);
-    if (directUrl) urls.add(directUrl);
+    if (directUrl) {
+      consulted.push({ title: sourceTitle(directUrl), url: directUrl });
+    }
 
     if (Array.isArray(action.sources)) {
       for (const source of action.sources) {
         if (typeof source !== "object" || source === null) continue;
-        const sourceUrl = httpUrl((source as Record<string, unknown>).url);
-        if (sourceUrl) urls.add(sourceUrl);
+        const record = source as Record<string, unknown>;
+        const sourceUrl = httpUrl(record.url);
+        if (sourceUrl) {
+          consulted.push({
+            title: sourceTitle(sourceUrl, record.title),
+            url: sourceUrl,
+          });
+        }
       }
     }
   }
 
-  return urls;
+  return deduplicateSources([...citations, ...consulted]);
 }
 
-function equivalentUrl(left: string, right: string): boolean {
-  const normalize = (value: string): string => value.replace(/\/+$/, "");
-  return normalize(left) === normalize(right);
+function diagnosticUrl(value: string): string {
+  const url = new URL(value);
+  url.username = "";
+  url.password = "";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export function getWebSearchDiagnostics(
+  output: readonly unknown[],
+): WebSearchDiagnostics {
+  const calls = output.filter(
+    (item): item is Record<string, unknown> =>
+      typeof item === "object" &&
+      item !== null &&
+      "type" in item &&
+      item.type === "web_search_call",
+  );
+  const sources = extractWebSources(output);
+  const statuses = calls.map((call) => call.status);
+  const actions = calls
+    .map((call) =>
+      typeof call.action === "object" &&
+      call.action !== null &&
+      "type" in call.action &&
+      typeof call.action.type === "string"
+        ? call.action.type
+        : "unknown",
+    );
+
+  return {
+    triggered: calls.length > 0,
+    callCount: calls.length,
+    completedCallCount: statuses.filter((status) => status === "completed")
+      .length,
+    failedCallCount: statuses.filter((status) => status === "failed").length,
+    statuses: statuses.map((status) =>
+      typeof status === "string" ? status : "unknown",
+    ),
+    actions,
+    sourceCount: sources.length,
+    sourceDomains: [
+      ...new Set(sources.map((source) => new URL(source.url).hostname)),
+    ],
+    sourceUrls: sources
+      .slice(0, 25)
+      .map((source) => diagnosticUrl(source.url)),
+  };
 }
 
 export function parseWebSourcedAnswer(
@@ -253,7 +415,7 @@ export function parseWebSourcedAnswer(
   }
 
   const row = value as Record<string, unknown>;
-  const sourceUrl = httpUrl(row.primary_source_url);
+  const requestedSourceUrl = httpUrl(row.primary_source_url);
 
   if (
     typeof row.answer !== "string" ||
@@ -262,8 +424,7 @@ export function parseWebSourcedAnswer(
     row.fact_summary.trim().length === 0 ||
     typeof row.primary_source_title !== "string" ||
     row.primary_source_title.trim().length === 0 ||
-    !sourceUrl ||
-    sourceUrl.length > 1_000 ||
+    (requestedSourceUrl !== undefined && requestedSourceUrl.length > 1_000) ||
     row.is_karting_related !== true ||
     typeof row.used_verified_knowledge !== "boolean" ||
     typeof row.used_structured_knowledge !== "boolean"
@@ -271,17 +432,26 @@ export function parseWebSourcedAnswer(
     throw new Error("OpenAI returned an invalid web-grounded response.");
   }
 
-  const consultedUrls = sourceUrlsFromOutput(outputItems);
-  if (![...consultedUrls].some((url) => equivalentUrl(url, sourceUrl))) {
+  const consultedSources = extractWebSources(outputItems);
+  const selectedSource = requestedSourceUrl
+    ? (consultedSources.find((source) =>
+        equivalentUrl(source.url, requestedSourceUrl),
+      ) ??
+      consultedSources.find((source) =>
+        sameAuthorityDomain(source.url, requestedSourceUrl),
+      ))
+    : consultedSources[0];
+
+  if (!selectedSource) {
     throw new Error("OpenAI did not substantiate its selected web source.");
   }
 
   return {
-    answerText: row.answer.trim(),
+    answerText: condenseAnswerForDiscord(row.answer),
     factText: row.fact_summary.trim(),
     source: {
-      title: row.primary_source_title.trim(),
-      url: sourceUrl,
+      title: selectedSource.title || row.primary_source_title.trim(),
+      url: selectedSource.url,
     },
     usedVerifiedKnowledge:
       verifiedKnowledgeWasAvailable && row.used_verified_knowledge,
@@ -294,21 +464,21 @@ export function appendWebSourceCitation(
   answerText: string,
   source: WebSource,
 ): string {
-  const cleanAnswer = answerText.trim();
+  const cleanAnswer = condenseAnswerForDiscord(answerText);
   if (cleanAnswer.includes(source.url)) {
     return cleanAnswer;
   }
 
   const citation = `📎 Source: <${source.url}>`;
-  const maximumLength = 1_850;
+  const maximumLength = MAX_ORACLE_ANSWER_CHARACTERS;
   const availableAnswerLength = Math.max(
     0,
     maximumLength - citation.length - 2,
   );
-  const displayedAnswer =
-    cleanAnswer.length <= availableAnswerLength
-      ? cleanAnswer
-      : `${cleanAnswer.slice(0, Math.max(0, availableAnswerLength - 3)).trimEnd()}...`;
+  const displayedAnswer = condenseAnswerForDiscord(
+    cleanAnswer,
+    availableAnswerLength,
+  );
 
   return `${displayedAnswer}\n\n${citation}`;
 }

@@ -178,9 +178,13 @@ The first OpenAI response remains a karting-only topic and retrieval decision. T
 
 Typical routed facts are circuit addresses and postcodes, official websites, contact details, opening hours, current fleets, current events/schedules, and current products. Ordinary racecraft, setup, and driving advice does not trigger web retrieval. Venue-location questions are specifically routed when trusted knowledge does not already contain a complete address/postcode.
 
-The web prompt prioritises an official circuit, championship, manufacturer, organiser, or retailer source. The selected source URL must also appear in the web tool's returned source metadata or the result is rejected. A validated source link is included in Discord whenever web retrieval contributes the fact.
+The web prompt prioritises an official circuit, championship, manufacturer, organiser, or retailer source. Citation annotations and the complete web-search source list are both parsed. The selected source must match a consulted URL or its authoritative parent/subdomain; unrelated model-generated URLs are rejected. Straightforward conclusions may be drawn from authoritative specifications, such as identifying a four-stroke combustion kart as petrol rather than electric. A validated source link is included in Discord whenever web retrieval contributes the fact.
+
+Northflank logs record whether targeted web retrieval was required, whether the cache avoided a tool call, response/tool status, action types, sanitized public source domains/URLs, source-validation success, and safe OpenAI error fields. API keys, authorization headers, URL query strings, and environment-variable values are never logged. Web responses are capped at three processed tool calls.
 
 Results are cached by a normalized fact query. Addresses expire after 180 days, official websites after 90 days, contact information after 30 days, fleets after 7 days, opening hours/current products after 24 hours, and event schedules after 6 hours. An expired or missing cache row causes a fresh lookup; a fresh matching row avoids another paid web search. No additional API key is required because this uses the existing `OPENAI_API_KEY`.
+
+Answer length is matched to question complexity: simple answers usually target 300–700 characters, normal answers 700–1,200, and complicated answers normally remain below 1,500. The application enforces a hard 1,800-character answer maximum, removes unnecessary follow-up offers, and condenses overlong output at complete sentence or clause boundaries while preserving the direct answer and citation. OpenAI text verbosity is set to low, with separate 2,000-token planning and 2,500-token web-response safeguards so tool reasoning is not cut off by the Discord character budget.
 
 ### Test web retrieval in Discord
 

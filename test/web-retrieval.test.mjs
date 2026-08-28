@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   appendWebSourceCitation,
   createWebCacheKey,
+  getWebSearchDiagnostics,
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
@@ -114,6 +115,95 @@ test("accepts only a source actually returned by the web tool", () => {
   );
 });
 
+test("accepts Silverstone first-party citations across official subdomains", () => {
+  const citedUrl =
+    "https://www.kart.silverstone.co.uk/the-experience?utm_source=openai";
+  const parsed = parseWebSourcedAnswer(
+    JSON.stringify({
+      answer:
+        "They are petrol-powered combustion karts, not electric. Silverstone identifies the fleet and the manufacturer specifies four-stroke combustion power, which supports that straightforward conclusion.",
+      fact_summary:
+        "Kart Silverstone uses petrol-powered four-stroke combustion rental karts.",
+      primary_source_title: "Kart Silverstone",
+      primary_source_url: "https://www.silverstone.co.uk/karting",
+      is_karting_related: true,
+      used_verified_knowledge: false,
+      used_structured_knowledge: false,
+    }),
+    [
+      {
+        type: "web_search_call",
+        status: "completed",
+        action: {
+          type: "search",
+          sources: [
+            { type: "url", url: "https://www.kart.silverstone.co.uk/" },
+            { type: "url", url: citedUrl },
+            {
+              type: "url",
+              url: "https://www.sodikart.com/en-gb/karts/rental/rt10-42.html",
+            },
+          ],
+        },
+      },
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            text: "structured response",
+            annotations: [
+              {
+                type: "url_citation",
+                title: "The Experience | Kart Silverstone",
+                url: citedUrl,
+                start_index: 0,
+                end_index: 10,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    false,
+    false,
+  );
+
+  assert.match(parsed.answerText, /petrol-powered combustion karts/i);
+  assert.equal(parsed.source.url, citedUrl);
+  assert.equal(parsed.source.title, "The Experience | Kart Silverstone");
+});
+
+test("reports web tool status and sanitized cited sources", () => {
+  const diagnostics = getWebSearchDiagnostics([
+    {
+      type: "web_search_call",
+      status: "completed",
+      action: {
+        type: "search",
+        sources: [
+          {
+            type: "url",
+            url: "https://www.kart.silverstone.co.uk/the-experience?utm_source=openai",
+          },
+        ],
+      },
+    },
+  ]);
+
+  assert.equal(diagnostics.triggered, true);
+  assert.equal(diagnostics.completedCallCount, 1);
+  assert.deepEqual(diagnostics.statuses, ["completed"]);
+  assert.deepEqual(diagnostics.actions, ["search"]);
+  assert.equal(diagnostics.sourceCount, 1);
+  assert.deepEqual(diagnostics.sourceDomains, [
+    "www.kart.silverstone.co.uk",
+  ]);
+  assert.deepEqual(diagnostics.sourceUrls, [
+    "https://www.kart.silverstone.co.uk/the-experience",
+  ]);
+});
+
 test("rejects a model-selected source that the web tool did not consult", () => {
   assert.throws(
     () =>
@@ -152,6 +242,7 @@ test("keeps the source citation when a long answer must be shortened", () => {
   };
   const displayed = appendWebSourceCitation("A".repeat(1_800), source);
 
-  assert.ok(displayed.length <= 1_850);
+  assert.ok(displayed.length <= 1_800);
+  assert.ok(!displayed.includes("..."));
   assert.ok(displayed.endsWith(`📎 Source: <${source.url}>`));
 });
