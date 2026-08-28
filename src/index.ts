@@ -32,6 +32,13 @@ import {
 } from "./answer-editing.js";
 import { ChannelConfigStore } from "./channel-config-store.js";
 import {
+  createPendingClarification,
+  isRepeatedClarification,
+  PendingClarificationStore,
+  resolvePendingClarification,
+  updatePendingClarification,
+} from "./clarification-state.js";
+import {
   resolveConversationContextLimits,
   selectConversationContext,
   type ConversationMessage,
@@ -39,6 +46,7 @@ import {
 import {
   formatRemainingQuestions,
   limitReachedMessage,
+  shouldReserveDailyQuestion,
   type DailyQuestionReservation,
 } from "./daily-limit.js";
 import {
@@ -74,6 +82,7 @@ import {
   ORACLE_INSTRUCTIONS,
   ORACLE_RESPONSE_FORMAT,
   parseOracleResponse,
+  type ClarificationPromptContext,
   type OracleAnswer,
   WEB_ORACLE_INSTRUCTIONS,
 } from "./oracle-response.js";
@@ -104,6 +113,7 @@ import {
   appendWebSourceCitation,
   createWebCacheKey,
   getWebSearchDiagnostics,
+  isLikelyFirstPartySourceForRequest,
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
@@ -171,6 +181,29 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function withTypingIndicator<T>(
+  sendTyping: () => Promise<unknown>,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const refreshTyping = async (): Promise<void> => {
+    await sendTyping().catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      console.error(`Could not send the typing indicator: ${detail}`);
+    });
+  };
+
+  await refreshTyping();
+  const refreshTimer = setInterval(() => {
+    void refreshTyping();
+  }, 8_000);
+
+  try {
+    return await operation();
+  } finally {
+    clearInterval(refreshTimer);
+  }
+}
+
 async function main(): Promise<void> {
   const discordToken = readEnvironmentVariable("DISCORD_TOKEN");
   const openaiApiKey = readEnvironmentVariable("OPENAI_API_KEY");
@@ -184,6 +217,7 @@ async function main(): Promise<void> {
   const channelConfig = new ChannelConfigStore(CHANNEL_CONFIG_PATH);
   const answerUpdates = new KeyedSerialQueue();
   const questionUpdates = new KeyedSerialQueue();
+  const pendingClarifications = new PendingClarificationStore();
   const promptedGuildIds = new Set<string>();
   const promptingGuildIds = new Set<string>();
 
@@ -208,6 +242,7 @@ async function main(): Promise<void> {
     conversation: Awaited<
       ReturnType<SupabaseService["getConversationHistory"]>
     >,
+    clarificationContext?: ClarificationPromptContext,
   ): Promise<OracleAnswer> {
     const response = await openai.responses.create({
       model: OPENAI_MODEL,
@@ -217,6 +252,7 @@ async function main(): Promise<void> {
         verifiedKnowledge,
         structuredKnowledge,
         conversation,
+        clarificationContext,
       ),
       max_output_tokens: OPENAI_PLANNING_OUTPUT_TOKEN_LIMIT,
       text: {
@@ -272,15 +308,31 @@ async function main(): Promise<void> {
       const cached = await database.getWebRetrievalCache(cacheKey);
 
       if (cached) {
-        console.log(
-          `[web-search] cache_hit=true tool_invoked=false fact_type=${cached.factType}`,
-        );
-        return {
-          text: cached.answerText,
-          isKartingRelated: true,
-          usedVerifiedKnowledge: cached.usedVerifiedKnowledge,
-          usedStructuredKnowledge: cached.usedStructuredKnowledge,
+        const cachedSource = cached.sources[0];
+        const evidenceContext = {
+          question: prompt,
+          query: webRequest.query,
+          factType: webRequest.factType,
         };
+
+        if (
+          cachedSource &&
+          isLikelyFirstPartySourceForRequest(cachedSource, evidenceContext)
+        ) {
+          console.log(
+            `[web-search] cache_hit=true tool_invoked=false fact_type=${cached.factType}`,
+          );
+          return {
+            text: cached.answerText,
+            isKartingRelated: true,
+            usedVerifiedKnowledge: cached.usedVerifiedKnowledge,
+            usedStructuredKnowledge: cached.usedStructuredKnowledge,
+          };
+        }
+
+        console.warn(
+          `[web-search] cache_hit=true validation=ignored_non_first_party fact_type=${cached.factType}`,
+        );
       }
     } catch (error) {
       logDatabaseError(
@@ -340,6 +392,11 @@ async function main(): Promise<void> {
         webResponse.output,
         verifiedKnowledge.length > 0,
         structuredKnowledge.length > 0,
+        {
+          question: prompt,
+          query: webRequest.query,
+          factType: webRequest.factType,
+        },
       );
       const answerText = appendWebSourceCitation(
         sourcedAnswer.answerText,
@@ -1453,6 +1510,15 @@ async function main(): Promise<void> {
 
   async function handleOracleMessage(message: Message<true>): Promise<void> {
     const prompt = message.content.trim();
+    const pendingClarification = pendingClarifications.get(
+      message.guildId,
+      message.author.id,
+    );
+    const clarificationResolution = resolvePendingClarification(
+      pendingClarification,
+      prompt,
+    );
+    const effectivePrompt = clarificationResolution.effectiveQuestion;
     const sendFailure = async (content: string): Promise<void> => {
       await message
         .reply({
@@ -1488,14 +1554,14 @@ async function main(): Promise<void> {
     }
 
     const [verifiedKnowledge, structuredKnowledge] = await Promise.all([
-      database.searchVerifiedKnowledge(prompt, 3).catch((error: unknown) => {
+      database.searchVerifiedKnowledge(effectivePrompt, 3).catch((error: unknown) => {
         logDatabaseError(
           "Verified knowledge search failed; answering without it",
           error,
         );
         return [] as VerifiedKnowledge[];
       }),
-      database.searchStructuredKnowledge(prompt, 4).catch((error: unknown) => {
+      database.searchStructuredKnowledge(effectivePrompt, 4).catch((error: unknown) => {
         logDatabaseError(
           "Structured knowledge search failed; answering without it",
           error,
@@ -1505,7 +1571,7 @@ async function main(): Promise<void> {
     ]);
 
     const topic = classifyTopic(
-      prompt,
+      effectivePrompt,
       history.length > 0,
       verifiedKnowledge.length > 0 || structuredKnowledge.length > 0,
     );
@@ -1532,7 +1598,12 @@ async function main(): Promise<void> {
 
     let reservation: DailyQuestionReservation | undefined;
 
-    if (!isModerator) {
+    if (
+      shouldReserveDailyQuestion(
+        isModerator,
+        clarificationResolution.isClarificationReply,
+      )
+    ) {
       try {
         reservation = await database.reserveDailyQuestion(
           message.guildId,
@@ -1567,19 +1638,64 @@ async function main(): Promise<void> {
       }
     };
 
-    await message.channel.sendTyping().catch((error: unknown) => {
-      const detail = error instanceof Error ? error.message : "Unknown error";
-      console.error(`Could not send the typing indicator: ${detail}`);
-    });
-
     let oracleAnswer: OracleAnswer;
 
     try {
-      oracleAnswer = await generateOracleAnswer(
-        prompt,
-        verifiedKnowledge,
-        structuredKnowledge,
-        history,
+      const clarificationContext = pendingClarification
+        ? {
+            mustResumeOriginal: clarificationResolution.resolved,
+            previousClarifications: pendingClarification.askedClarifications,
+          }
+        : undefined;
+      oracleAnswer = await withTypingIndicator(
+        () => message.channel.sendTyping(),
+        async () => {
+          let generated = await generateOracleAnswer(
+            effectivePrompt,
+            verifiedKnowledge,
+            structuredKnowledge,
+            history,
+            clarificationContext,
+          );
+
+          if (
+            pendingClarification &&
+            generated.clarification &&
+            isRepeatedClarification(
+              pendingClarification,
+              generated.clarification,
+            )
+          ) {
+            console.warn(
+              `[clarification] repeated=true guild_id=${message.guildId} user_id=${message.author.id}`,
+            );
+            generated = await generateOracleAnswer(
+              `${effectivePrompt}\nThe previous attempt repeated an already-answered clarification. Give the best supported answer to the original question now.`,
+              verifiedKnowledge,
+              structuredKnowledge,
+              history,
+              {
+                mustResumeOriginal: true,
+                previousClarifications:
+                  pendingClarification.askedClarifications,
+              },
+            );
+
+            if (
+              generated.clarification &&
+              isRepeatedClarification(
+                pendingClarification,
+                generated.clarification,
+              )
+            ) {
+              throw new Error(
+                "OpenAI repeated an already-resolved clarification twice.",
+              );
+            }
+          }
+
+          return generated;
+        },
       );
     } catch (error) {
       console.error(
@@ -1603,7 +1719,7 @@ async function main(): Promise<void> {
         discordMessageId: message.id,
         discordGuildId: message.guildId,
         discordUserId: message.author.id,
-        questionText: prompt,
+        questionText: effectivePrompt,
       });
     } catch (error) {
       logDatabaseError("Could not save the Discord question", error);
@@ -1630,7 +1746,7 @@ async function main(): Promise<void> {
         discordUserId: message.author.id,
         questionId,
         answerId,
-        questionText: prompt,
+        questionText: effectivePrompt,
         answerText: oracleAnswer.text,
       });
       conversationSaved = true;
@@ -1689,6 +1805,28 @@ async function main(): Promise<void> {
 
     if (!discordReply) {
       return;
+    }
+
+    if (oracleAnswer.clarification) {
+      const nextPending = pendingClarification
+        ? updatePendingClarification(
+            pendingClarification,
+            oracleAnswer.clarification,
+          )
+        : createPendingClarification(prompt, oracleAnswer.clarification);
+      pendingClarifications.set(
+        message.guildId,
+        message.author.id,
+        nextPending,
+      );
+      console.log(
+        `[clarification] pending=true guild_id=${message.guildId} user_id=${message.author.id}`,
+      );
+    } else if (pendingClarification) {
+      pendingClarifications.clear(message.guildId, message.author.id);
+      console.log(
+        `[clarification] resolved=true guild_id=${message.guildId} user_id=${message.author.id}`,
+      );
     }
 
     if (reservation?.dailyLimit !== undefined && reservation.allowed) {

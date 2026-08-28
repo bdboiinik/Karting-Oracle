@@ -68,6 +68,9 @@ test("does not claim verified knowledge was used when none was available", () =>
       requires_web_retrieval: false,
       web_search_query: "",
       web_fact_type: "none",
+      response_type: "answer",
+      clarification_missing_information: "",
+      clarification_candidate_interpretation: "",
     }),
     false,
   );
@@ -90,6 +93,9 @@ test("returns a targeted karting web retrieval request", () => {
       requires_web_retrieval: true,
       web_search_query: "Buckmore Park official address postcode",
       web_fact_type: "location_address",
+      response_type: "answer",
+      clarification_missing_information: "",
+      clarification_candidate_interpretation: "",
     }),
     false,
   );
@@ -97,6 +103,30 @@ test("returns a targeted karting web retrieval request", () => {
   assert.deepEqual(parsed.webRetrievalRequest, {
     query: "Buckmore Park official address postcode",
     factType: "location_address",
+  });
+});
+
+test("returns machine-readable clarification state", () => {
+  const parsed = parseOracleResponse(
+    JSON.stringify({
+      answer: "Do you mean Silverstone Karting at Silverstone Circuit?",
+      is_karting_related: true,
+      used_verified_knowledge: false,
+      used_structured_knowledge: false,
+      requires_web_retrieval: false,
+      web_search_query: "",
+      web_fact_type: "none",
+      response_type: "clarification",
+      clarification_missing_information: "which karting venue the user means",
+      clarification_candidate_interpretation:
+        "Silverstone Karting at Silverstone Circuit",
+    }),
+    false,
+  );
+
+  assert.deepEqual(parsed.clarification, {
+    missingInformation: "which karting venue the user means",
+    candidateInterpretation: "Silverstone Karting at Silverstone Circuit",
   });
 });
 

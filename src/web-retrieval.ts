@@ -49,6 +49,12 @@ export interface WebSourcedAnswer {
   usedStructuredKnowledge: boolean;
 }
 
+export interface WebEvidenceContext {
+  question: string;
+  query: string;
+  factType: WebFactType;
+}
+
 export interface WebSearchDiagnostics {
   triggered: boolean;
   callCount: number;
@@ -74,6 +80,8 @@ export const WEB_ORACLE_RESPONSE_FORMAT = {
       fact_summary: { type: "string", maxLength: 4000 },
       primary_source_title: { type: "string" },
       primary_source_url: { type: "string", maxLength: 1000 },
+      subject_entity: { type: "string", maxLength: 300 },
+      evidence_summary: { type: "string", maxLength: 1000 },
       is_karting_related: { type: "boolean" },
       used_verified_knowledge: { type: "boolean" },
       used_structured_knowledge: { type: "boolean" },
@@ -83,6 +91,8 @@ export const WEB_ORACLE_RESPONSE_FORMAT = {
       "fact_summary",
       "primary_source_title",
       "primary_source_url",
+      "subject_entity",
+      "evidence_summary",
       "is_karting_related",
       "used_verified_knowledge",
       "used_structured_knowledge",
@@ -106,6 +116,8 @@ const WEB_CACHE_TTL_MS: Record<WebFactType, number> = {
 
 const VENUE_LOCATION_PATTERN =
   /\b(where\s+(?:is|are)|where's|located|location|full\s+address|address|post\s*code)\b/i;
+const VENUE_FLEET_PATTERN =
+  /\b(?:karts?|fleet)\b[\s\S]{0,180}\b(?:petrol|gasoline|electric|engine|powered|four[ -]?stroke|two[ -]?stroke)\b|\b(?:petrol|gasoline|electric|engine|powered|four[ -]?stroke|two[ -]?stroke)\b[\s\S]{0,180}\b(?:karts?|fleet)\b/i;
 const POSTAL_CODE_PATTERN =
   /\b(?:GIR\s*0AA|[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}|[A-Z]\d[A-Z]\s*\d[A-Z]\d|\d{5}(?:-\d{4})?)\b|\b(?:postcode|postal\s+code|zip)\s*:?\s*[A-Z0-9][A-Z0-9 -]{2,10}\b/i;
 
@@ -196,6 +208,17 @@ export function resolveWebRetrievalRequest(
     };
   }
 
+  if (
+    VENUE_FLEET_PATTERN.test(question) &&
+    /\boriginal question:/i.test(question) &&
+    /\buser clarification:/i.test(question)
+  ) {
+    return {
+      factType: "current_fleet",
+      query: `${question.slice(0, 300).trim()} official venue fleet engine petrol electric`,
+    };
+  }
+
   return undefined;
 }
 
@@ -262,6 +285,129 @@ function deduplicateSources(sources: WebSource[]): WebSource[] {
     seen.add(key);
     return true;
   });
+}
+
+const GENERIC_ENTITY_WORDS = new Set([
+  "about",
+  "address",
+  "circuit",
+  "contact",
+  "current",
+  "electric",
+  "events",
+  "fleet",
+  "hours",
+  "kart",
+  "karting",
+  "karts",
+  "located",
+  "official",
+  "opening",
+  "petrol",
+  "postcode",
+  "racing",
+  "schedule",
+  "source",
+  "track",
+  "venue",
+  "website",
+]);
+
+function distinctiveEntityWords(value: string): string[] {
+  return normalizeWebQuery(value)
+    .split(" ")
+    .filter((word) => word.length >= 4 && !GENERIC_ENTITY_WORDS.has(word));
+}
+
+export function isLikelyFirstPartySourceForRequest(
+  source: WebSource,
+  context: WebEvidenceContext,
+  subjectEntity = "",
+): boolean {
+  const requestText = normalizeWebQuery(`${context.question} ${context.query}`);
+  const declaredEntityWords = distinctiveEntityWords(subjectEntity);
+  const requestEntityWords = distinctiveEntityWords(
+    `${context.question} ${context.query}`,
+  );
+  const entityWords =
+    declaredEntityWords.length > 0 ? declaredEntityWords : requestEntityWords;
+
+  if (
+    declaredEntityWords.length > 0 &&
+    !declaredEntityWords.some((word) => requestText.includes(word))
+  ) {
+    return false;
+  }
+
+  const hostname = normalizeWebQuery(new URL(source.url).hostname);
+  return entityWords.some((word) => hostname.includes(word));
+}
+
+function evidenceAddressesFactType(
+  factType: WebFactType,
+  factText: string,
+  evidenceSummary: string,
+): boolean {
+  const evidence = `${factText} ${evidenceSummary}`;
+  const patterns: Partial<Record<WebFactType, RegExp>> = {
+    location_address: /\b(address|postcode|postal|located|road|street|lane)\b/i,
+    official_website: /\b(official|website|site|url)\b/i,
+    contact_information: /\b(contact|phone|telephone|email|call)\b/i,
+    opening_hours: /\b(open|opening|hours|closed|am|pm)\b/i,
+    events_schedule: /\b(event|schedule|date|time|championship|race)\b/i,
+    current_fleet:
+      /\b(petrol|gasoline|electric|combustion|engine|four[ -]?stroke|two[ -]?stroke|fleet|kart model)\b/i,
+    current_product: /\b(product|model|price|stock|available|specification)\b/i,
+  };
+
+  return patterns[factType]?.test(evidence) ?? evidence.trim().length > 0;
+}
+
+export function extractCitedWebSources(output: readonly unknown[]): WebSource[] {
+  const citations: WebSource[] = [];
+
+  for (const item of output) {
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      !("type" in item) ||
+      item.type !== "message" ||
+      !("content" in item) ||
+      !Array.isArray(item.content)
+    ) {
+      continue;
+    }
+
+    for (const part of item.content) {
+      if (
+        typeof part !== "object" ||
+        part === null ||
+        !("annotations" in part) ||
+        !Array.isArray(part.annotations)
+      ) {
+        continue;
+      }
+
+      for (const annotation of part.annotations) {
+        if (
+          typeof annotation !== "object" ||
+          annotation === null ||
+          !("type" in annotation) ||
+          annotation.type !== "url_citation"
+        ) {
+          continue;
+        }
+
+        const record = annotation as Record<string, unknown>;
+        const url = httpUrl(record.url);
+        if (url) {
+          citations.push({ title: sourceTitle(url, record.title), url });
+        }
+      }
+    }
+  }
+
+  return deduplicateSources(citations);
 }
 
 export function extractWebSources(output: readonly unknown[]): WebSource[] {
@@ -401,6 +547,7 @@ export function parseWebSourcedAnswer(
   outputItems: readonly unknown[],
   verifiedKnowledgeWasAvailable: boolean,
   structuredKnowledgeWasAvailable: boolean,
+  evidenceContext?: WebEvidenceContext,
 ): WebSourcedAnswer {
   let value: unknown;
 
@@ -424,7 +571,12 @@ export function parseWebSourcedAnswer(
     row.fact_summary.trim().length === 0 ||
     typeof row.primary_source_title !== "string" ||
     row.primary_source_title.trim().length === 0 ||
-    (requestedSourceUrl !== undefined && requestedSourceUrl.length > 1_000) ||
+    !requestedSourceUrl ||
+    requestedSourceUrl.length > 1_000 ||
+    typeof row.subject_entity !== "string" ||
+    row.subject_entity.trim().length === 0 ||
+    typeof row.evidence_summary !== "string" ||
+    row.evidence_summary.trim().length === 0 ||
     row.is_karting_related !== true ||
     typeof row.used_verified_knowledge !== "boolean" ||
     typeof row.used_structured_knowledge !== "boolean"
@@ -432,18 +584,45 @@ export function parseWebSourcedAnswer(
     throw new Error("OpenAI returned an invalid web-grounded response.");
   }
 
-  const consultedSources = extractWebSources(outputItems);
-  const selectedSource = requestedSourceUrl
-    ? (consultedSources.find((source) =>
-        equivalentUrl(source.url, requestedSourceUrl),
-      ) ??
-      consultedSources.find((source) =>
-        sameAuthorityDomain(source.url, requestedSourceUrl),
-      ))
-    : consultedSources[0];
+  const citedSources = extractCitedWebSources(outputItems);
+  const selectedSource =
+    citedSources.find((source) =>
+      equivalentUrl(source.url, requestedSourceUrl),
+    ) ??
+    citedSources.find((source) =>
+      sameAuthorityDomain(source.url, requestedSourceUrl),
+    );
 
   if (!selectedSource) {
-    throw new Error("OpenAI did not substantiate its selected web source.");
+    throw new Error(
+      "OpenAI did not cite its selected source as evidence for the answer.",
+    );
+  }
+
+  if (
+    evidenceContext &&
+    !isLikelyFirstPartySourceForRequest(
+      selectedSource,
+      evidenceContext,
+      row.subject_entity,
+    )
+  ) {
+    throw new Error(
+      "OpenAI selected a source that is not first-party for the requested entity.",
+    );
+  }
+
+  if (
+    evidenceContext &&
+    !evidenceAddressesFactType(
+      evidenceContext.factType,
+      row.fact_summary,
+      row.evidence_summary,
+    )
+  ) {
+    throw new Error(
+      "OpenAI's cited evidence does not address the requested factual claim.",
+    );
   }
 
   return {

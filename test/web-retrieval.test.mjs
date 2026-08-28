@@ -8,6 +8,7 @@ import {
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
+  isLikelyFirstPartySourceForRequest,
 } from "../dist/web-retrieval.js";
 
 test("forces incomplete karting venue locations through web retrieval", () => {
@@ -42,6 +43,17 @@ test("does not route ordinary karting advice without a model request", () => {
     ),
     undefined,
   );
+});
+
+test("routes a resolved venue petrol-or-electric fleet question to the web", () => {
+  const request = resolveWebRetrievalRequest(
+    "Original question: Are the karts at Silverton petrol or electric?\nUser clarification: Silverstone Karting at Silverstone Circuit",
+    { isKartingRelated: true },
+    "",
+  );
+
+  assert.equal(request?.factType, "current_fleet");
+  assert.match(request?.query ?? "", /Silverstone/i);
 });
 
 test("does not retrieve a venue location already complete in trusted knowledge", () => {
@@ -91,6 +103,9 @@ test("accepts only a source actually returned by the web tool", () => {
       fact_summary: "Maidstone Road, Chatham, Kent, ME5 9QG",
       primary_source_title: "Buckmore Park",
       primary_source_url: sourceUrl,
+      subject_entity: "Buckmore Park",
+      evidence_summary:
+        "Buckmore Park's official contact page gives its full address and postcode.",
       is_karting_related: true,
       used_verified_knowledge: false,
       used_structured_knowledge: false,
@@ -103,9 +118,29 @@ test("accepts only a source actually returned by the web tool", () => {
           sources: [{ type: "url", url: sourceUrl }],
         },
       },
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            annotations: [
+              {
+                type: "url_citation",
+                title: "Buckmore Park",
+                url: sourceUrl,
+              },
+            ],
+          },
+        ],
+      },
     ],
     false,
     false,
+    {
+      question: "Where is Buckmore Park located?",
+      query: "Buckmore Park official address postcode",
+      factType: "location_address",
+    },
   );
 
   assert.equal(parsed.source.url, sourceUrl);
@@ -126,6 +161,9 @@ test("accepts Silverstone first-party citations across official subdomains", () 
         "Kart Silverstone uses petrol-powered four-stroke combustion rental karts.",
       primary_source_title: "Kart Silverstone",
       primary_source_url: "https://www.silverstone.co.uk/karting",
+      subject_entity: "Silverstone Karting",
+      evidence_summary:
+        "The official Silverstone karting page identifies the combustion-powered rental fleet.",
       is_karting_related: true,
       used_verified_knowledge: false,
       used_structured_knowledge: false,
@@ -167,6 +205,12 @@ test("accepts Silverstone first-party citations across official subdomains", () 
     ],
     false,
     false,
+    {
+      question:
+        "Are the karts at Silverstone Karting at Silverstone Circuit petrol or electric?",
+      query: "Silverstone Karting official fleet petrol electric",
+      factType: "current_fleet",
+    },
   );
 
   assert.match(parsed.answerText, /petrol-powered combustion karts/i);
@@ -213,6 +257,8 @@ test("rejects a model-selected source that the web tool did not consult", () => 
           fact_summary: "Unsupported fact",
           primary_source_title: "Invented",
           primary_source_url: "https://invented.example/address",
+          subject_entity: "Official Example",
+          evidence_summary: "The page gives the venue address.",
           is_karting_related: true,
           used_verified_knowledge: false,
           used_structured_knowledge: false,
@@ -231,7 +277,65 @@ test("rejects a model-selected source that the web tool did not consult", () => 
         false,
         false,
       ),
-    /did not substantiate/,
+    /did not cite/,
+  );
+});
+
+test("rejects a generic karting source for a Silverstone venue claim", () => {
+  const weakSource = "https://thegrid-racing.com/karting-guide";
+  const context = {
+    question:
+      "Are the karts at Silverstone Karting at Silverstone Circuit petrol or electric?",
+    query: "Silverstone Karting official fleet petrol electric",
+    factType: "current_fleet",
+  };
+
+  assert.equal(
+    isLikelyFirstPartySourceForRequest(
+      { title: "Karting guide", url: weakSource },
+      context,
+      "Silverstone Karting",
+    ),
+    false,
+  );
+
+  assert.throws(
+    () =>
+      parseWebSourcedAnswer(
+        JSON.stringify({
+          answer: "The karts are petrol powered.",
+          fact_summary: "The venue uses petrol karts.",
+          primary_source_title: "Karting guide",
+          primary_source_url: weakSource,
+          subject_entity: "Silverstone Karting",
+          evidence_summary:
+            "This generic guide discusses petrol-powered rental karts.",
+          is_karting_related: true,
+          used_verified_knowledge: false,
+          used_structured_knowledge: false,
+        }),
+        [
+          {
+            type: "message",
+            content: [
+              {
+                type: "output_text",
+                annotations: [
+                  {
+                    type: "url_citation",
+                    title: "Karting guide",
+                    url: weakSource,
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+        false,
+        false,
+        context,
+      ),
+    /not first-party/,
   );
 });
 

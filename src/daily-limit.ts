@@ -5,6 +5,13 @@ export interface DailyQuestionReservation {
   remaining: number | undefined;
 }
 
+export function shouldReserveDailyQuestion(
+  isModerator: boolean,
+  isClarificationReply: boolean,
+): boolean {
+  return !isModerator && !isClarificationReply;
+}
+
 export function formatRemainingQuestions(
   reservation: DailyQuestionReservation,
 ): string | undefined {

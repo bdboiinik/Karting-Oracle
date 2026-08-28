@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   formatRemainingQuestions,
   limitReachedMessage,
+  shouldReserveDailyQuestion,
 } from "../dist/daily-limit.js";
 import { memberHasModeratorRole } from "../dist/moderator-roles.js";
 
@@ -22,6 +23,12 @@ test("shows remaining daily questions only when a limit is enabled", () => {
     undefined,
   );
   assert.match(limitReachedMessage(1), /daily limit of 1 AI question/);
+});
+
+test("clarification replies do not reserve another daily question", () => {
+  assert.equal(shouldReserveDailyQuestion(false, false), true);
+  assert.equal(shouldReserveDailyQuestion(false, true), false);
+  assert.equal(shouldReserveDailyQuestion(true, false), false);
 });
 
 test("moderator exemption requires any configured role", () => {
