@@ -3,12 +3,15 @@ import test from "node:test";
 
 import {
   appendWebSourceCitation,
+  classifyWebTemporalIntent,
   createWebCacheKey,
   getWebSearchDiagnostics,
+  isAcceptableWebSourceForRequest,
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
   isLikelyFirstPartySourceForRequest,
+  webRetrievalFailureMessage,
 } from "../dist/web-retrieval.js";
 
 test("forces incomplete karting venue locations through web retrieval", () => {
@@ -53,6 +56,7 @@ test("routes a resolved venue petrol-or-electric fleet question to the web", () 
   );
 
   assert.equal(request?.factType, "current_fleet");
+  assert.equal(request?.temporalMode, "current");
   assert.match(request?.query ?? "", /Silverstone/i);
 });
 
@@ -65,6 +69,7 @@ test("does not retrieve a venue location already complete in trusted knowledge",
         webRetrievalRequest: {
           query: "Buckmore Park official address postcode",
           factType: "location_address",
+          temporalMode: "current",
         },
       },
       "Buckmore Park, Maidstone Road, Chatham, Kent, ME5 9QG",
@@ -93,6 +98,234 @@ test("uses long TTLs for addresses and short TTLs for schedules", () => {
   assert.ok(
     webCacheTtlMs("opening_hours") > webCacheTtlMs("events_schedule"),
   );
+  assert.ok(
+    webCacheTtlMs("events_schedule", "historical_pattern") >
+      webCacheTtlMs("events_schedule", "current"),
+  );
+  assert.notEqual(
+    createWebCacheKey("BRKC dates", "events_schedule", "current"),
+    createWebCacheKey(
+      "BRKC dates",
+      "events_schedule",
+      "historical_pattern",
+    ),
+  );
+});
+
+test("When is BRKC 2027 remains a current confirmation question", () => {
+  const question = "When is BRKC 2027?";
+  const request = resolveWebRetrievalRequest(
+    question,
+    { isKartingRelated: true },
+    "",
+  );
+
+  assert.equal(classifyWebTemporalIntent(question, 2026), "current");
+  assert.equal(request?.factType, "events_schedule");
+  assert.equal(request?.temporalMode, "current");
+  assert.match(request?.query ?? "", /confirmed event date announcement/i);
+});
+
+test("When is BRKC normally held routes to historical pattern research", () => {
+  const question = "When is BRKC normally held?";
+  const request = resolveWebRetrievalRequest(
+    question,
+    { isKartingRelated: true },
+    "",
+  );
+
+  assert.equal(classifyWebTemporalIntent(question), "historical_pattern");
+  assert.equal(request?.temporalMode, "historical_pattern");
+  assert.match(request?.query ?? "", /historical dates previous editions/i);
+});
+
+test("BRKC past-years requests accept several dates and a labelled estimate", () => {
+  const question = "When is BRKC held based on past years?";
+  const request = resolveWebRetrievalRequest(
+    question,
+    { isKartingRelated: true },
+    "",
+  );
+  const sourceUrl = "https://brkc.co.uk/history";
+
+  assert.equal(request?.temporalMode, "historical_pattern");
+  const parsed = parseWebSourcedAnswer(
+    JSON.stringify({
+      answer:
+        "**Estimate — not confirmed:** BRKC would most likely be held in mid-to-late January. Recent editions were held on similar January weekends, but wait for the organiser's announcement before making plans.",
+      fact_summary:
+        "BRKC has historically run in January; a future unannounced edition is most likely in mid-to-late January.",
+      primary_source_title: "BRKC history",
+      primary_source_url: sourceUrl,
+      subject_entity: "BRKC",
+      evidence_summary:
+        "The official BRKC history lists January dates for multiple previous editions.",
+      temporal_answer_type: "historical_pattern_estimate",
+      historical_data_points: [
+        "BRKC 2024: 19–21 January 2024",
+        "BRKC 2025: 17–19 January 2025",
+        "BRKC 2026: 16–18 January 2026",
+      ],
+      is_karting_related: true,
+      used_verified_knowledge: false,
+      used_structured_knowledge: false,
+    }),
+    [
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            annotations: [
+              {
+                type: "url_citation",
+                title: "BRKC history",
+                url: sourceUrl,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    false,
+    false,
+    {
+      question,
+      query: request?.query ?? "",
+      factType: "events_schedule",
+      temporalMode: "historical_pattern",
+    },
+  );
+
+  assert.equal(parsed.temporalAnswerType, "historical_pattern_estimate");
+  assert.equal(parsed.historicalDataPoints.length, 3);
+  assert.match(parsed.answerText, /Estimate/i);
+  assert.doesNotMatch(
+    webRetrievalFailureMessage("historical_pattern"),
+    /current information/i,
+  );
+});
+
+test("current event questions cannot be answered with an unlabelled estimate", () => {
+  const sourceUrl = "https://brkc.co.uk/";
+
+  assert.throws(
+    () =>
+      parseWebSourcedAnswer(
+        JSON.stringify({
+          answer: "BRKC 2027 will probably be in January.",
+          fact_summary: "BRKC 2027 may be in January.",
+          primary_source_title: "BRKC",
+          primary_source_url: sourceUrl,
+          subject_entity: "BRKC",
+          evidence_summary: "The official site describes the annual event.",
+          temporal_answer_type: "historical_pattern_estimate",
+          historical_data_points: [
+            "BRKC 2025 was in January",
+            "BRKC 2026 was in January",
+          ],
+          is_karting_related: true,
+          used_verified_knowledge: false,
+          used_structured_knowledge: false,
+        }),
+        [
+          {
+            type: "message",
+            content: [
+              {
+                type: "output_text",
+                annotations: [
+                  { type: "url_citation", title: "BRKC", url: sourceUrl },
+                ],
+              },
+            ],
+          },
+        ],
+        false,
+        false,
+        {
+          question: "When is BRKC 2027?",
+          query: "BRKC 2027 official confirmed event date announcement",
+          factType: "events_schedule",
+          temporalMode: "current",
+        },
+      ),
+    /temporal evidence standard/,
+  );
+});
+
+test("entity-matched timing sources are historical support, not current authority", () => {
+  const source = {
+    title: "BRKC 2025 results",
+    url: "https://results.alphatiming.co.uk/brkc/2025",
+  };
+  const baseContext = {
+    question: "When was BRKC 2025 held?",
+    query: "BRKC 2025 historical event date results archive",
+    factType: "events_schedule",
+  };
+
+  assert.equal(
+    isAcceptableWebSourceForRequest(
+      source,
+      { ...baseContext, temporalMode: "historical" },
+      "BRKC",
+    ),
+    true,
+  );
+  assert.equal(
+    isAcceptableWebSourceForRequest(
+      source,
+      { ...baseContext, temporalMode: "current" },
+      "BRKC",
+    ),
+    false,
+  );
+});
+
+test("a future BRKC question may clearly report that the date is not announced", () => {
+  const sourceUrl = "https://brkc.co.uk/";
+  const parsed = parseWebSourcedAnswer(
+    JSON.stringify({
+      answer:
+        "BRKC 2027 has not been officially announced yet, so there is no confirmed date to report.",
+      fact_summary: "No official BRKC 2027 event date has been announced.",
+      primary_source_title: "BRKC",
+      primary_source_url: sourceUrl,
+      subject_entity: "BRKC",
+      evidence_summary:
+        "The official BRKC site does not list a confirmed 2027 event date.",
+      temporal_answer_type: "current_not_announced",
+      historical_data_points: [],
+      is_karting_related: true,
+      used_verified_knowledge: false,
+      used_structured_knowledge: false,
+    }),
+    [
+      {
+        type: "message",
+        content: [
+          {
+            type: "output_text",
+            annotations: [
+              { type: "url_citation", title: "BRKC", url: sourceUrl },
+            ],
+          },
+        ],
+      },
+    ],
+    false,
+    false,
+    {
+      question: "When is BRKC 2027?",
+      query: "BRKC 2027 official confirmed event date announcement",
+      factType: "events_schedule",
+      temporalMode: "current",
+    },
+  );
+
+  assert.equal(parsed.temporalAnswerType, "current_not_announced");
+  assert.match(parsed.answerText, /not been officially announced/i);
 });
 
 test("accepts only a source actually returned by the web tool", () => {
@@ -106,6 +339,8 @@ test("accepts only a source actually returned by the web tool", () => {
       subject_entity: "Buckmore Park",
       evidence_summary:
         "Buckmore Park's official contact page gives its full address and postcode.",
+      temporal_answer_type: "current_confirmed",
+      historical_data_points: [],
       is_karting_related: true,
       used_verified_knowledge: false,
       used_structured_knowledge: false,
@@ -140,6 +375,7 @@ test("accepts only a source actually returned by the web tool", () => {
       question: "Where is Buckmore Park located?",
       query: "Buckmore Park official address postcode",
       factType: "location_address",
+      temporalMode: "current",
     },
   );
 
@@ -164,6 +400,8 @@ test("accepts Silverstone first-party citations across official subdomains", () 
       subject_entity: "Silverstone Karting",
       evidence_summary:
         "The official Silverstone karting page identifies the combustion-powered rental fleet.",
+      temporal_answer_type: "current_confirmed",
+      historical_data_points: [],
       is_karting_related: true,
       used_verified_knowledge: false,
       used_structured_knowledge: false,
@@ -210,6 +448,7 @@ test("accepts Silverstone first-party citations across official subdomains", () 
         "Are the karts at Silverstone Karting at Silverstone Circuit petrol or electric?",
       query: "Silverstone Karting official fleet petrol electric",
       factType: "current_fleet",
+      temporalMode: "current",
     },
   );
 
@@ -259,6 +498,8 @@ test("rejects a model-selected source that the web tool did not consult", () => 
           primary_source_url: "https://invented.example/address",
           subject_entity: "Official Example",
           evidence_summary: "The page gives the venue address.",
+          temporal_answer_type: "current_confirmed",
+          historical_data_points: [],
           is_karting_related: true,
           used_verified_knowledge: false,
           used_structured_knowledge: false,
@@ -288,6 +529,7 @@ test("rejects a generic karting source for a Silverstone venue claim", () => {
       "Are the karts at Silverstone Karting at Silverstone Circuit petrol or electric?",
     query: "Silverstone Karting official fleet petrol electric",
     factType: "current_fleet",
+    temporalMode: "current",
   };
 
   assert.equal(
@@ -310,6 +552,8 @@ test("rejects a generic karting source for a Silverstone venue claim", () => {
           subject_entity: "Silverstone Karting",
           evidence_summary:
             "This generic guide discusses petrol-powered rental karts.",
+          temporal_answer_type: "current_confirmed",
+          historical_data_points: [],
           is_karting_related: true,
           used_verified_knowledge: false,
           used_structured_knowledge: false,

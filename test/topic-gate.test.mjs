@@ -15,6 +15,10 @@ test("allows karting-related outside information and ambiguous follow-ups", () =
     "karting",
   );
   assert.equal(classifyTopic("What about the other one?", true, false), "karting");
+  assert.equal(
+    classifyTopic("When is BRKC held based on past years?", false, false),
+    "karting",
+  );
 });
 
 test("still rejects explicit off-topic requests after a karting conversation", () => {

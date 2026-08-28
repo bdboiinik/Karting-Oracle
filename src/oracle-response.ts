@@ -5,6 +5,8 @@ import type { StructuredKnowledge } from "./structured-knowledge.js";
 import type { VerifiedKnowledge } from "./supabase-service.js";
 import {
   WEB_FACT_TYPES,
+  WEB_TEMPORAL_MODES,
+  type WebTemporalMode,
   type WebRetrievalRequest,
 } from "./web-retrieval.js";
 
@@ -41,6 +43,10 @@ export const ORACLE_RESPONSE_FORMAT = {
         type: "string",
         enum: ["none", ...WEB_FACT_TYPES],
       },
+      web_temporal_mode: {
+        type: "string",
+        enum: ["none", ...WEB_TEMPORAL_MODES],
+      },
       response_type: {
         type: "string",
         enum: ["answer", "clarification"],
@@ -59,6 +65,7 @@ export const ORACLE_RESPONSE_FORMAT = {
       "requires_web_retrieval",
       "web_search_query",
       "web_fact_type",
+      "web_temporal_mode",
       "response_type",
       "clarification_missing_information",
       "clarification_candidate_interpretation",
@@ -85,17 +92,21 @@ Format for Discord using short paragraphs and readable spacing. Most simple and 
 
 export const ORACLE_INSTRUCTIONS = `${ORACLE_BASE_INSTRUCTIONS}
 
-No web tool is available in this planning response. Set requires_web_retrieval to true only when the question is karting-related and answering it accurately requires a current or exact public fact that is not sufficiently established by the supplied structured or verified knowledge. Suitable facts include venue addresses/postcodes, official websites, contact details, opening hours, current fleets, current events/schedules, and current products. Do not request web retrieval for ordinary driving, setup, racecraft, or general advice.
+No web tool is available in this planning response. Set requires_web_retrieval to true only when the question is karting-related and answering it accurately requires a public fact that is not sufficiently established by supplied structured or verified knowledge. Suitable facts include venue addresses/postcodes, official websites, contact details, opening hours, current fleets, current events/schedules, historical event dates, historical patterns, and current products. Do not request web retrieval for ordinary driving, setup, racecraft, or general advice.
+
+Classify web temporal intent explicitly. Use web_temporal_mode "current" for a requested current or future confirmed fact, including a named future edition such as "When is BRKC 2027?". Use "historical" for a specific past fact. Use "historical_pattern" when the user asks what normally/usually happens or requests an estimate based on past years. Historical-pattern questions require several past data points where possible and a clearly labelled estimate; they are not failed current-date lookups. When no web retrieval is needed, use web_temporal_mode "none".
 
 For a karting venue location question, if the supplied structured or verified knowledge does not contain a sufficiently complete address and postcode, set requires_web_retrieval to true even if you know the approximate town. The first user-facing answer must contain the complete useful location when an official source can establish it.
 
-Web retrieval must never be requested for an off-topic question. If requires_web_retrieval is true, provide a short canonical web_search_query focused on the named karting entity and requested fact, prefer an official first-party source, and select the matching web_fact_type. Otherwise use an empty web_search_query and web_fact_type "none".`;
+Web retrieval must never be requested for an off-topic question. If requires_web_retrieval is true, provide a short canonical web_search_query focused on the named karting entity, requested fact, and temporal intent; prefer an official first-party source and select the matching web_fact_type and web_temporal_mode. Otherwise use an empty web_search_query, web_fact_type "none", and web_temporal_mode "none".`;
 
 export const WEB_ORACLE_INSTRUCTIONS = `${ORACLE_BASE_INSTRUCTIONS}
 
-This request has already passed the karting-only topic check and has been approved for one targeted web lookup. Use the web search tool to answer the exact current factual request. Use the named circuit, championship, manufacturer, organiser, or retailer's official first-party website for venue-specific claims. A generic karting article, directory, aggregator, or another venue's page is not evidence about the named venue. Use one authoritative source when it is sufficient. If no first-party source actually supports both the named entity and the requested factual claim, clearly say the fact could not be verified; do not substitute a merely related source.
+This request has already passed the karting-only topic check and has been approved for targeted web research. Follow the Approved temporal mode in the input. For "current", verify a confirmed current/future fact or state clearly that it has not been announced; do not estimate a requested future edition unless the user asked for an estimate. For "historical", retrieve the requested past fact. For "historical_pattern", gather several relevant past dates where possible, summarise the pattern, and label any projection as an estimate rather than a confirmed date.
 
-Put the complete useful fact in the answer immediately. For a venue location, include the full official address and postcode when available. Straightforward factual inference from authoritative evidence is allowed and should be expressed clearly: for example, an official venue page identifying an engine or kart model plus that manufacturer's official specification may support petrol/combustion rather than electric. Do not require the final answer wording to appear verbatim on a page. fact_summary must contain only the reusable factual result, not conversational wording. subject_entity must be the exact named venue or organisation. evidence_summary must briefly state how the selected official source supports the exact claim. primary_source_url and primary_source_title must identify the first-party evidence actually cited in the response, not just a search result that was consulted. Do not add a Sources section to answer; the application adds the validated link.`;
+Prefer the named circuit, championship, manufacturer, organiser, or retailer's official first-party website. For historical modes, reliable archived pages or established timing/results sources may supplement first-party material when they identify the event and date. A generic karting article, directory, aggregator, or another venue's page is not evidence about the named entity. If the required evidence standard cannot be met, say so using language appropriate to the temporal mode rather than describing historical research as an unavailable current fact.
+
+Put the complete useful fact in the answer immediately. For a venue location, include the full official address and postcode when available. Straightforward factual inference from authoritative evidence is allowed and should be expressed clearly. fact_summary must contain only the reusable factual result. subject_entity must be the exact named venue or organisation. evidence_summary must state how the cited evidence supports the exact claim. primary_source_url and primary_source_title must identify evidence actually cited in the response, not merely a consulted search result. Set temporal_answer_type to match the approved mode: current_confirmed or current_not_announced for current; historical for historical; historical_pattern_estimate for a pattern-based estimate. historical_data_points must be empty for current answers, contain at least one dated fact for historical answers, and contain at least two distinct past dated facts for a historical-pattern estimate. A pattern estimate must explicitly use wording such as "Estimate" or "most likely" and state that it is not confirmed. Do not add a Sources section; the application adds the validated link.`;
 
 export function buildOracleInput(
   question: string,
@@ -163,6 +174,7 @@ export function buildOracleInput(
 export function buildWebOracleInput(
   question: string,
   searchQuery: string,
+  temporalMode: WebTemporalMode,
   verifiedKnowledge: VerifiedKnowledge[],
   structuredKnowledge: StructuredKnowledge[] = [],
   conversation: ConversationMessage[] = [],
@@ -172,7 +184,7 @@ export function buildWebOracleInput(
     verifiedKnowledge,
     structuredKnowledge,
     conversation,
-  )}\n\nApproved targeted web query:\n${searchQuery}`;
+  )}\n\nApproved temporal mode: ${temporalMode}\n\nApproved targeted web query:\n${searchQuery}`;
 }
 
 export function parseOracleResponse(
@@ -196,6 +208,7 @@ export function parseOracleResponse(
   const requiresWebRetrieval = row.requires_web_retrieval;
   const webSearchQuery = row.web_search_query;
   const webFactType = row.web_fact_type;
+  const webTemporalMode = row.web_temporal_mode;
   const responseType = row.response_type;
   const missingInformation = row.clarification_missing_information;
   const candidateInterpretation = row.clarification_candidate_interpretation;
@@ -210,6 +223,7 @@ export function parseOracleResponse(
     typeof webSearchQuery !== "string" ||
     webSearchQuery.length > 400 ||
     typeof webFactType !== "string" ||
+    typeof webTemporalMode !== "string" ||
     (responseType !== "answer" && responseType !== "clarification") ||
     typeof missingInformation !== "string" ||
     typeof candidateInterpretation !== "string" ||
@@ -221,8 +235,10 @@ export function parseOracleResponse(
       (webSearchQuery.trim().length === 0 ||
         !WEB_FACT_TYPES.includes(
           webFactType as (typeof WEB_FACT_TYPES)[number],
-        ))) ||
-    (!requiresWebRetrieval && webFactType !== "none")
+        ) ||
+        !WEB_TEMPORAL_MODES.includes(webTemporalMode as WebTemporalMode))) ||
+    (!requiresWebRetrieval &&
+      (webFactType !== "none" || webTemporalMode !== "none"))
   ) {
     throw new Error("OpenAI returned an invalid structured response.");
   }
@@ -232,6 +248,7 @@ export function parseOracleResponse(
       ? {
           query: webSearchQuery.trim(),
           factType: webFactType as (typeof WEB_FACT_TYPES)[number],
+          temporalMode: webTemporalMode as WebTemporalMode,
         }
       : undefined;
   const clarification =

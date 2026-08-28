@@ -18,9 +18,28 @@ export const WEB_FACT_TYPES = [
 
 export type WebFactType = (typeof WEB_FACT_TYPES)[number];
 
+export const WEB_TEMPORAL_MODES = [
+  "current",
+  "historical",
+  "historical_pattern",
+] as const;
+
+export type WebTemporalMode = (typeof WEB_TEMPORAL_MODES)[number];
+
+export const WEB_TEMPORAL_ANSWER_TYPES = [
+  "current_confirmed",
+  "current_not_announced",
+  "historical",
+  "historical_pattern_estimate",
+] as const;
+
+export type WebTemporalAnswerType =
+  (typeof WEB_TEMPORAL_ANSWER_TYPES)[number];
+
 export interface WebRetrievalRequest {
   query: string;
   factType: WebFactType;
+  temporalMode: WebTemporalMode;
 }
 
 export interface WebSource {
@@ -47,12 +66,15 @@ export interface WebSourcedAnswer {
   source: WebSource;
   usedVerifiedKnowledge: boolean;
   usedStructuredKnowledge: boolean;
+  temporalAnswerType: WebTemporalAnswerType;
+  historicalDataPoints: string[];
 }
 
 export interface WebEvidenceContext {
   question: string;
   query: string;
   factType: WebFactType;
+  temporalMode: WebTemporalMode;
 }
 
 export interface WebSearchDiagnostics {
@@ -71,7 +93,7 @@ export const WEB_ORACLE_RESPONSE_FORMAT = {
   type: "json_schema",
   name: "karting_oracle_web_answer",
   description:
-    "A concise karting answer grounded in a current public web source.",
+    "A concise karting answer grounded in authoritative current or historical web evidence.",
   strict: true,
   schema: {
     type: "object",
@@ -82,6 +104,15 @@ export const WEB_ORACLE_RESPONSE_FORMAT = {
       primary_source_url: { type: "string", maxLength: 1000 },
       subject_entity: { type: "string", maxLength: 300 },
       evidence_summary: { type: "string", maxLength: 1000 },
+      temporal_answer_type: {
+        type: "string",
+        enum: WEB_TEMPORAL_ANSWER_TYPES,
+      },
+      historical_data_points: {
+        type: "array",
+        items: { type: "string", maxLength: 300 },
+        maxItems: 8,
+      },
       is_karting_related: { type: "boolean" },
       used_verified_knowledge: { type: "boolean" },
       used_structured_knowledge: { type: "boolean" },
@@ -93,6 +124,8 @@ export const WEB_ORACLE_RESPONSE_FORMAT = {
       "primary_source_url",
       "subject_entity",
       "evidence_summary",
+      "temporal_answer_type",
+      "historical_data_points",
       "is_karting_related",
       "used_verified_knowledge",
       "used_structured_knowledge",
@@ -113,6 +146,8 @@ const WEB_CACHE_TTL_MS: Record<WebFactType, number> = {
   current_product: DAY_MS,
   other_current: DAY_MS,
 };
+const HISTORICAL_CACHE_TTL_MS = 180 * DAY_MS;
+const HISTORICAL_PATTERN_CACHE_TTL_MS = 30 * DAY_MS;
 
 const VENUE_LOCATION_PATTERN =
   /\b(where\s+(?:is|are)|where's|located|location|full\s+address|address|post\s*code)\b/i;
@@ -128,8 +163,43 @@ export function isWebFactType(value: unknown): value is WebFactType {
   );
 }
 
-export function webCacheTtlMs(factType: WebFactType): number {
+export function webCacheTtlMs(
+  factType: WebFactType,
+  temporalMode: WebTemporalMode = "current",
+): number {
+  if (temporalMode === "historical") return HISTORICAL_CACHE_TTL_MS;
+  if (temporalMode === "historical_pattern") {
+    return HISTORICAL_PATTERN_CACHE_TTL_MS;
+  }
   return WEB_CACHE_TTL_MS[factType];
+}
+
+export function classifyWebTemporalIntent(
+  question: string,
+  currentYear = new Date().getUTCFullYear(),
+): WebTemporalMode {
+  if (
+    /\b(?:based on past years?|past years?|normally|usually|typically|historical(?:ly)?|annual pattern|time of year|previous editions?)\b/i.test(
+      question,
+    )
+  ) {
+    return "historical_pattern";
+  }
+
+  const mentionedYears = [...question.matchAll(/\b(19\d{2}|20\d{2})\b/g)].map(
+    (match) => Number(match[1]),
+  );
+  if (
+    /\b(?:when was|history|past event|previous year|last year)\b/i.test(
+      question,
+    ) ||
+    (mentionedYears.length > 0 &&
+      mentionedYears.every((year) => year < currentYear))
+  ) {
+    return "historical";
+  }
+
+  return "current";
 }
 
 export function normalizeWebQuery(query: string): string {
@@ -144,10 +214,35 @@ export function normalizeWebQuery(query: string): string {
 export function createWebCacheKey(
   query: string,
   factType: WebFactType,
+  temporalMode: WebTemporalMode = "current",
 ): string {
   return createHash("sha256")
-    .update(`${factType}:${normalizeWebQuery(query)}`)
+    .update(`${temporalMode}:${factType}:${normalizeWebQuery(query)}`)
     .digest("hex");
+}
+
+function temporalEventSearchQuery(
+  question: string,
+  temporalMode: WebTemporalMode,
+): string {
+  const subject = question.trim().slice(0, 300);
+
+  if (temporalMode === "historical_pattern") {
+    return `${subject} official historical dates previous editions annual timing results`;
+  }
+
+  if (temporalMode === "historical") {
+    return `${subject} official historical event date results archive`;
+  }
+
+  return `${subject} official confirmed event date announcement`;
+}
+
+function isEventTimingQuestion(question: string): boolean {
+  return (
+    /\bwhen\b/i.test(question) &&
+    /\b(?:brkc|championship|event|race|round|finals?)\b/i.test(question)
+  );
 }
 
 export function trustedKnowledgeHasCompleteLocation(
@@ -194,8 +289,13 @@ export function resolveWebRetrievalRequest(
     return undefined;
   }
 
+  const temporalMode = classifyWebTemporalIntent(question);
+
   if (answer.webRetrievalRequest) {
-    return answer.webRetrievalRequest;
+    return {
+      ...answer.webRetrievalRequest,
+      temporalMode,
+    };
   }
 
   if (
@@ -205,6 +305,7 @@ export function resolveWebRetrievalRequest(
     return {
       factType: "location_address",
       query: venueSearchQuery(question),
+      temporalMode: "current",
     };
   }
 
@@ -216,6 +317,15 @@ export function resolveWebRetrievalRequest(
     return {
       factType: "current_fleet",
       query: `${question.slice(0, 300).trim()} official venue fleet engine petrol electric`,
+      temporalMode: "current",
+    };
+  }
+
+  if (isEventTimingQuestion(question)) {
+    return {
+      factType: "events_schedule",
+      query: temporalEventSearchQuery(question, temporalMode),
+      temporalMode,
     };
   }
 
@@ -303,14 +413,17 @@ const GENERIC_ENTITY_WORDS = new Set([
   "located",
   "official",
   "opening",
+  "past",
   "petrol",
   "postcode",
+  "previous",
   "racing",
   "schedule",
   "source",
   "track",
   "venue",
   "website",
+  "years",
 ]);
 
 function distinctiveEntityWords(value: string): string[] {
@@ -343,6 +456,36 @@ export function isLikelyFirstPartySourceForRequest(
   return entityWords.some((word) => hostname.includes(word));
 }
 
+const RELIABLE_HISTORICAL_HOST_PATTERN =
+  /(?:^|[.-])(?:archive|archives|results|result|timing|speedhive|alphatiming|race-monitor)(?:[.-]|$)/i;
+
+export function isAcceptableWebSourceForRequest(
+  source: WebSource,
+  context: WebEvidenceContext,
+  subjectEntity = "",
+): boolean {
+  if (isLikelyFirstPartySourceForRequest(source, context, subjectEntity)) {
+    return true;
+  }
+
+  if (context.temporalMode === "current") {
+    return false;
+  }
+
+  const entityWords = distinctiveEntityWords(
+    subjectEntity || `${context.question} ${context.query}`,
+  );
+  const url = new URL(source.url);
+  const sourceIdentity = normalizeWebQuery(
+    `${url.hostname} ${url.pathname} ${source.title}`,
+  );
+
+  return (
+    RELIABLE_HISTORICAL_HOST_PATTERN.test(url.hostname) &&
+    entityWords.some((word) => sourceIdentity.includes(word))
+  );
+}
+
 function evidenceAddressesFactType(
   factType: WebFactType,
   factText: string,
@@ -354,13 +497,64 @@ function evidenceAddressesFactType(
     official_website: /\b(official|website|site|url)\b/i,
     contact_information: /\b(contact|phone|telephone|email|call)\b/i,
     opening_hours: /\b(open|opening|hours|closed|am|pm)\b/i,
-    events_schedule: /\b(event|schedule|date|time|championship|race)\b/i,
+    events_schedule:
+      /\b(event|schedule|dates?|time|championship|race|editions?|annual|january|february|march|april|may|june|july|august|september|october|november|december)\b/i,
     current_fleet:
       /\b(petrol|gasoline|electric|combustion|engine|four[ -]?stroke|two[ -]?stroke|fleet|kart model)\b/i,
     current_product: /\b(product|model|price|stock|available|specification)\b/i,
   };
 
   return patterns[factType]?.test(evidence) ?? evidence.trim().length > 0;
+}
+
+function temporalEvidenceIsValid(
+  temporalMode: WebTemporalMode,
+  temporalAnswerType: WebTemporalAnswerType,
+  historicalDataPoints: string[],
+  answerText: string,
+): boolean {
+  const datedHistoricalPoints = historicalDataPoints.filter((point) =>
+    /\b(?:19|20)\d{2}\b/.test(point),
+  );
+  const distinctDatedPoints = new Set(
+    datedHistoricalPoints.map((point) => normalizeWebQuery(point)),
+  );
+
+  if (temporalMode === "current") {
+    return (
+      (temporalAnswerType === "current_confirmed" ||
+        temporalAnswerType === "current_not_announced") &&
+      historicalDataPoints.length === 0
+    );
+  }
+
+  if (temporalMode === "historical") {
+    return (
+      temporalAnswerType === "historical" && distinctDatedPoints.size >= 1
+    );
+  }
+
+  return (
+    temporalAnswerType === "historical_pattern_estimate" &&
+    distinctDatedPoints.size >= 2 &&
+    /\b(?:estimate|estimated|likely|typically|normally|pattern|not confirmed|unconfirmed)\b/i.test(
+      answerText,
+    )
+  );
+}
+
+export function webRetrievalFailureMessage(
+  temporalMode: WebTemporalMode,
+): string {
+  if (temporalMode === "historical") {
+    return "I couldn't verify that historical karting information from an authoritative source, so I won't invent a date.";
+  }
+
+  if (temporalMode === "historical_pattern") {
+    return "I couldn't find enough reliable historical dates to make a responsible estimate. That does not mean a future date has been ruled out; it means the past pattern could not be established.";
+  }
+
+  return "I couldn't verify that current information from an official source right now, so I won't guess. Please try again shortly.";
 }
 
 export function extractCitedWebSources(output: readonly unknown[]): WebSource[] {
@@ -563,6 +757,8 @@ export function parseWebSourcedAnswer(
 
   const row = value as Record<string, unknown>;
   const requestedSourceUrl = httpUrl(row.primary_source_url);
+  const temporalAnswerType = row.temporal_answer_type;
+  const historicalDataPoints = row.historical_data_points;
 
   if (
     typeof row.answer !== "string" ||
@@ -577,6 +773,16 @@ export function parseWebSourcedAnswer(
     row.subject_entity.trim().length === 0 ||
     typeof row.evidence_summary !== "string" ||
     row.evidence_summary.trim().length === 0 ||
+    !WEB_TEMPORAL_ANSWER_TYPES.includes(
+      temporalAnswerType as WebTemporalAnswerType,
+    ) ||
+    !Array.isArray(historicalDataPoints) ||
+    historicalDataPoints.some(
+      (dataPoint) =>
+        typeof dataPoint !== "string" ||
+        dataPoint.trim().length === 0 ||
+        dataPoint.length > 300,
+    ) ||
     row.is_karting_related !== true ||
     typeof row.used_verified_knowledge !== "boolean" ||
     typeof row.used_structured_knowledge !== "boolean"
@@ -601,14 +807,30 @@ export function parseWebSourcedAnswer(
 
   if (
     evidenceContext &&
-    !isLikelyFirstPartySourceForRequest(
+    !isAcceptableWebSourceForRequest(
       selectedSource,
       evidenceContext,
       row.subject_entity,
     )
   ) {
     throw new Error(
-      "OpenAI selected a source that is not first-party for the requested entity.",
+      evidenceContext.temporalMode === "current"
+        ? "OpenAI selected a source that is not first-party for the requested entity."
+        : "OpenAI selected a source that is not authoritative historical evidence for the requested entity.",
+    );
+  }
+
+  if (
+    evidenceContext &&
+    !temporalEvidenceIsValid(
+      evidenceContext.temporalMode,
+      temporalAnswerType as WebTemporalAnswerType,
+      historicalDataPoints as string[],
+      row.answer,
+    )
+  ) {
+    throw new Error(
+      "OpenAI's response did not satisfy the requested temporal evidence standard.",
     );
   }
 
@@ -636,6 +858,10 @@ export function parseWebSourcedAnswer(
       verifiedKnowledgeWasAvailable && row.used_verified_knowledge,
     usedStructuredKnowledge:
       structuredKnowledgeWasAvailable && row.used_structured_knowledge,
+    temporalAnswerType: temporalAnswerType as WebTemporalAnswerType,
+    historicalDataPoints: (historicalDataPoints as string[]).map((point) =>
+      point.trim(),
+    ),
   };
 }
 

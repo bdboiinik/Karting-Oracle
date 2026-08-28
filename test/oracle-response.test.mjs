@@ -68,6 +68,7 @@ test("does not claim verified knowledge was used when none was available", () =>
       requires_web_retrieval: false,
       web_search_query: "",
       web_fact_type: "none",
+      web_temporal_mode: "none",
       response_type: "answer",
       clarification_missing_information: "",
       clarification_candidate_interpretation: "",
@@ -93,6 +94,7 @@ test("returns a targeted karting web retrieval request", () => {
       requires_web_retrieval: true,
       web_search_query: "Buckmore Park official address postcode",
       web_fact_type: "location_address",
+      web_temporal_mode: "current",
       response_type: "answer",
       clarification_missing_information: "",
       clarification_candidate_interpretation: "",
@@ -103,6 +105,7 @@ test("returns a targeted karting web retrieval request", () => {
   assert.deepEqual(parsed.webRetrievalRequest, {
     query: "Buckmore Park official address postcode",
     factType: "location_address",
+    temporalMode: "current",
   });
 });
 
@@ -116,6 +119,7 @@ test("returns machine-readable clarification state", () => {
       requires_web_retrieval: false,
       web_search_query: "",
       web_fact_type: "none",
+      web_temporal_mode: "none",
       response_type: "clarification",
       clarification_missing_information: "which karting venue the user means",
       clarification_candidate_interpretation:

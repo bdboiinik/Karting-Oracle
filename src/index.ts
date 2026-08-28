@@ -113,10 +113,11 @@ import {
   appendWebSourceCitation,
   createWebCacheKey,
   getWebSearchDiagnostics,
-  isLikelyFirstPartySourceForRequest,
+  isAcceptableWebSourceForRequest,
   parseWebSourcedAnswer,
   resolveWebRetrievalRequest,
   webCacheTtlMs,
+  webRetrievalFailureMessage,
   WEB_ORACLE_RESPONSE_FORMAT,
 } from "./web-retrieval.js";
 
@@ -299,9 +300,13 @@ async function main(): Promise<void> {
       return initialAnswer;
     }
 
-    const cacheKey = createWebCacheKey(webRequest.query, webRequest.factType);
+    const cacheKey = createWebCacheKey(
+      webRequest.query,
+      webRequest.factType,
+      webRequest.temporalMode,
+    );
     console.log(
-      `[web-search] required=true fact_type=${webRequest.factType} cache_key=${cacheKey.slice(0, 12)}`,
+      `[web-search] required=true fact_type=${webRequest.factType} temporal_mode=${webRequest.temporalMode} cache_key=${cacheKey.slice(0, 12)}`,
     );
 
     try {
@@ -313,11 +318,12 @@ async function main(): Promise<void> {
           question: prompt,
           query: webRequest.query,
           factType: webRequest.factType,
+          temporalMode: webRequest.temporalMode,
         };
 
         if (
           cachedSource &&
-          isLikelyFirstPartySourceForRequest(cachedSource, evidenceContext)
+          isAcceptableWebSourceForRequest(cachedSource, evidenceContext)
         ) {
           console.log(
             `[web-search] cache_hit=true tool_invoked=false fact_type=${cached.factType}`,
@@ -331,7 +337,7 @@ async function main(): Promise<void> {
         }
 
         console.warn(
-          `[web-search] cache_hit=true validation=ignored_non_first_party fact_type=${cached.factType}`,
+          `[web-search] cache_hit=true validation=ignored_inadequate_source fact_type=${cached.factType} temporal_mode=${webRequest.temporalMode}`,
         );
       }
     } catch (error) {
@@ -353,13 +359,22 @@ async function main(): Promise<void> {
         input: buildWebOracleInput(
           prompt,
           webRequest.query,
+          webRequest.temporalMode,
           verifiedKnowledge,
           structuredKnowledge,
           conversation,
         ),
         max_output_tokens: OPENAI_WEB_OUTPUT_TOKEN_LIMIT,
         max_tool_calls: OPENAI_MAX_WEB_TOOL_CALLS,
-        tools: [{ type: "web_search", search_context_size: "low" }],
+        tools: [
+          {
+            type: "web_search",
+            search_context_size:
+              webRequest.temporalMode === "historical_pattern"
+                ? "medium"
+                : "low",
+          },
+        ],
         tool_choice: "required",
         parallel_tool_calls: false,
         include: ["web_search_call.action.sources"],
@@ -396,6 +411,7 @@ async function main(): Promise<void> {
           question: prompt,
           query: webRequest.query,
           factType: webRequest.factType,
+          temporalMode: webRequest.temporalMode,
         },
       );
       const answerText = appendWebSourceCitation(
@@ -419,7 +435,8 @@ async function main(): Promise<void> {
           usedStructuredKnowledge: sourcedAnswer.usedStructuredKnowledge,
           fetchedAt: fetchedAt.toISOString(),
           expiresAt: new Date(
-            fetchedAt.getTime() + webCacheTtlMs(webRequest.factType),
+            fetchedAt.getTime() +
+              webCacheTtlMs(webRequest.factType, webRequest.temporalMode),
           ).toISOString(),
         })
         .catch((error: unknown) => {
@@ -440,7 +457,7 @@ async function main(): Promise<void> {
         `[web-search] validation_or_request=failed error=${safeErrorDetails(error)}`,
       );
       return {
-        text: "I couldn't verify that current information from an official source right now, so I won't guess. Please try again shortly.",
+        text: webRetrievalFailureMessage(webRequest.temporalMode),
         isKartingRelated: true,
         usedVerifiedKnowledge: false,
         usedStructuredKnowledge: false,
