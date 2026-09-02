@@ -32,6 +32,24 @@ test("registers the setup route as /oracle setup", () => {
   assert.equal(isOracleSetupCommand("oracle-setup", null), false);
 });
 
+test("registers moderator user-limit management under /oracle limit", () => {
+  const command = buildOracleCommand().toJSON();
+  const limitGroup = command.options?.find((option) => option.name === "limit");
+
+  assert.deepEqual(
+    limitGroup?.options?.map((option) => option.name),
+    ["daily", "off", "user", "reset-user", "status"],
+  );
+
+  const userCommand = limitGroup?.options?.find(
+    (option) => option.name === "user",
+  );
+  const personalLimit = userCommand?.options?.find(
+    (option) => option.name === "limit",
+  );
+  assert.equal(personalLimit?.min_value, 0);
+});
+
 test("builds a native selector restricted to one text channel", () => {
   const row = buildOracleChannelSelector().toJSON();
   const selector = row.components[0];

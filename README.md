@@ -7,6 +7,8 @@ V5 adds:
 - Conversation continuity isolated by Discord guild and user, with `/oracle reset`.
 - Configurable, token-bounded recent conversation context.
 - Moderator-controlled daily question limits for non-moderators.
+- Per-user daily-limit overrides, including a zero-limit access block.
+- An early conservative nonsense gate that avoids AI and web calls while still consuming allowance.
 - Moderator-managed authoritative structured karting knowledge.
 - Audited answer editing through a Discord modal.
 - Karting-only topic enforcement and more comprehensive answers.
@@ -84,6 +86,17 @@ Before deploying this web-retrieval version:
 
 The cache is separate from `structured_knowledge` and verified answers. A cached public-web result never becomes trusted community knowledge automatically. Row Level Security is enabled and only the backend service role is granted table access.
 
+### Existing V5 project: individual daily limits
+
+Before deploying this version:
+
+1. Open **Supabase > SQL Editor > New query**.
+2. Open [`supabase/migrations/20260902000000_add_user_question_limit_overrides.sql`](supabase/migrations/20260902000000_add_user_question_limit_overrides.sql).
+3. Copy the entire file into the query and select **Run**.
+4. Confirm **Table Editor** contains `user_question_limit_overrides`.
+
+This migration preserves the existing usage counters. Personal limits are stored per Discord server and user, so changing or removing an override never resets questions already used that day.
+
 ### New Supabase project
 
 Run these files in order in the SQL Editor:
@@ -92,6 +105,7 @@ Run these files in order in the SQL Editor:
 2. [`supabase/migrations/20260826010000_add_oracle_v4_verification.sql`](supabase/migrations/20260826010000_add_oracle_v4_verification.sql)
 3. [`supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql`](supabase/migrations/20260827000000_add_oracle_v5_conversations_limits_knowledge_edits.sql)
 4. [`supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql`](supabase/migrations/20260827010000_add_karting_web_retrieval_cache.sql)
+5. [`supabase/migrations/20260902000000_add_user_question_limit_overrides.sql`](supabase/migrations/20260902000000_add_user_question_limit_overrides.sql)
 
 The V4 migration adds service-role-only database functions for verification and verified knowledge search. Row Level Security remains enabled, and `anon` and `authenticated` users are not granted access. Never paste the Secret/service-role key into Discord, source files, `.env.example`, screenshots, or logs.
 
@@ -154,13 +168,18 @@ Configured moderators can use:
 ```text
 /oracle limit daily number:<number>
 /oracle limit off
+/oracle limit user user:<user> limit:<limit>
+/oracle limit reset-user user:<user>
+/oracle limit status user:<user>
 /oracle knowledge add
 /oracle knowledge edit
 /oracle knowledge view
 /oracle knowledge deactivate
 ```
 
-Daily limits apply only to non-moderators. A database transaction atomically reserves an allowance before OpenAI is called. The reservation is released when OpenAI fails, the request is rejected as off-topic, persistence fails, or Discord cannot receive the answer. Voting, verification, setup, reset, knowledge commands, and answer editing do not consume allowance.
+Daily limits apply only to non-moderators. A personal override takes precedence over the server default; `limit:0` blocks new Oracle questions until the override changes or is removed. Removing an override returns the user to the server default. A database transaction atomically reserves an allowance before OpenAI is called. The reservation is released when OpenAI fails, the request is rejected as off-topic, persistence fails, or Discord cannot receive the answer. Voting, verification, setup, reset, knowledge commands, limit-management commands, and answer editing do not consume allowance.
+
+Clearly unserious prompts that merely insert karting terminology are handled by an early, conservative fixed-response gate. They consume one reserved daily question, but do not load conversation history or knowledge and cannot invoke OpenAI or web search. Genuine, basic, unusual, or humorous karting questions continue through the normal Oracle flow.
 
 Structured knowledge supports discount codes, recommended gear, Brad's gear, events/schedules, links, and general karting information. Only active matching entries are supplied to OpenAI as authoritative context. The model is explicitly prohibited from inventing community-specific codes, dates, products, addresses, or URLs.
 
@@ -211,6 +230,16 @@ Answer length is matched to question complexity: simple answers usually target 3
 3. Ask a third question and confirm it is refused before OpenAI is called.
 4. Restart the bot and confirm the limit and usage remain.
 5. Confirm a configured moderator remains exempt, then run `/oracle limit off`.
+
+### Individual limit overrides and nonsense gate
+
+1. Set a server default, for example `/oracle limit daily number:20`.
+2. Run `/oracle limit user user:@TestUser limit:30`, then `/oracle limit status user:@TestUser`; confirm the effective limit and remaining count reflect today's existing usage.
+3. Change the override to `limit:5` after the user has used more than five questions; confirm remaining is zero and no new question is processed.
+4. Set `limit:0` and confirm the user receives only the short access message, with no AI answer buttons or web lookup.
+5. Run `/oracle limit reset-user user:@TestUser`; confirm status returns to the server default without resetting today's usage.
+6. As a non-moderator, attempt a limit-management command and confirm it is denied ephemerally.
+7. With allowance available, ask `Is a kart tyre an optimal breakfast?`; confirm the short playful response appears, the remaining count decreases by one, and no AI answer buttons or web citation appear.
 
 ### Structured knowledge
 

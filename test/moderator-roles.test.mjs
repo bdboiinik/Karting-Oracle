@@ -27,6 +27,16 @@ test("accepts a member with any configured moderator role", () => {
   );
 });
 
+test("configured moderators can manage user limits and non-moderators cannot", () => {
+  const configured = new Set(["oracle-moderator"]);
+
+  assert.equal(
+    memberHasModeratorRole(["member", "oracle-moderator"], configured),
+    true,
+  );
+  assert.equal(memberHasModeratorRole(["member"], configured), false);
+});
+
 test("uses the singular moderator role variable as a legacy fallback", () => {
   assert.deepEqual(
     [...resolveModeratorRoleIds({ MODERATOR_ROLE_ID: " 123456789 " })],

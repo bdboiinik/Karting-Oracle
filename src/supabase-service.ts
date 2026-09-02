@@ -1,7 +1,10 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 import type { ConversationMessage } from "./conversation-context.js";
-import type { DailyQuestionReservation } from "./daily-limit.js";
+import type {
+  DailyQuestionReservation,
+  UserQuestionLimitStatus,
+} from "./daily-limit.js";
 import type { RecordedVote, VoteTotals, VoteType } from "./feedback-types.js";
 import {
   isKnowledgeCategory,
@@ -54,6 +57,15 @@ interface DailyQuestionReservationRow {
   daily_limit: number | null;
   used: number;
   remaining: number | null;
+}
+
+interface UserQuestionLimitStatusRow {
+  server_daily_limit: number | null;
+  personal_daily_limit: number | null;
+  effective_daily_limit: number | null;
+  used: number;
+  remaining: number | null;
+  is_blocked: boolean;
 }
 
 interface StructuredKnowledgeRow {
@@ -180,6 +192,42 @@ function parseCount(value: number | string, field: string): number {
   }
 
   return count;
+}
+
+function parseUserQuestionLimitStatus(
+  row: UserQuestionLimitStatusRow,
+): UserQuestionLimitStatus {
+  const limits = [
+    row.server_daily_limit,
+    row.personal_daily_limit,
+    row.effective_daily_limit,
+  ];
+
+  if (
+    limits.some(
+      (limit) =>
+        limit !== null && (!Number.isSafeInteger(limit) || limit < 0),
+    ) ||
+    !Number.isSafeInteger(row.used) ||
+    row.used < 0 ||
+    (row.remaining !== null &&
+      (!Number.isSafeInteger(row.remaining) || row.remaining < 0)) ||
+    typeof row.is_blocked !== "boolean"
+  ) {
+    throw persistenceError("read user question limit", {
+      code: "INVALID_RESPONSE",
+      message: "Invalid user question limit status returned by the database.",
+    });
+  }
+
+  return {
+    serverDailyLimit: row.server_daily_limit ?? undefined,
+    personalDailyLimit: row.personal_daily_limit ?? undefined,
+    effectiveDailyLimit: row.effective_daily_limit ?? undefined,
+    used: row.used,
+    remaining: row.remaining ?? undefined,
+    isBlocked: row.is_blocked,
+  };
 }
 
 function parseTotals(row: VoteTotalsRow): VoteTotals {
@@ -364,6 +412,15 @@ export class SupabaseService {
 
     if (webCacheError) {
       throw persistenceError("check web retrieval cache schema", webCacheError);
+    }
+
+    const { error: userLimitError } = await this.client
+      .from("user_question_limit_overrides")
+      .select("discord_guild_id")
+      .limit(1);
+
+    if (userLimitError) {
+      throw persistenceError("check user question limit schema", userLimitError);
     }
   }
 
@@ -666,6 +723,64 @@ export class SupabaseService {
     return value ?? undefined;
   }
 
+  async setUserDailyQuestionLimit(
+    discordGuildId: string,
+    discordUserId: string,
+    dailyLimit: number,
+    discordModeratorUserId: string,
+  ): Promise<UserQuestionLimitStatus> {
+    const { data, error } = await this.client
+      .rpc("set_user_question_limit", {
+        target_discord_guild_id: discordGuildId,
+        target_discord_user_id: discordUserId,
+        target_daily_limit: dailyLimit,
+        target_discord_moderator_user_id: discordModeratorUserId,
+      })
+      .single();
+
+    if (error || !data) {
+      throw persistenceError("set user question limit", error);
+    }
+
+    return parseUserQuestionLimitStatus(data as UserQuestionLimitStatusRow);
+  }
+
+  async resetUserDailyQuestionLimit(
+    discordGuildId: string,
+    discordUserId: string,
+  ): Promise<UserQuestionLimitStatus> {
+    const { data, error } = await this.client
+      .rpc("reset_user_question_limit", {
+        target_discord_guild_id: discordGuildId,
+        target_discord_user_id: discordUserId,
+      })
+      .single();
+
+    if (error || !data) {
+      throw persistenceError("reset user question limit", error);
+    }
+
+    return parseUserQuestionLimitStatus(data as UserQuestionLimitStatusRow);
+  }
+
+  async getUserQuestionLimitStatus(
+    discordGuildId: string,
+    discordUserId: string,
+  ): Promise<UserQuestionLimitStatus> {
+    const { data, error } = await this.client
+      .rpc("get_user_question_limit_status", {
+        target_discord_guild_id: discordGuildId,
+        target_discord_user_id: discordUserId,
+      })
+      .single();
+
+    if (error || !data) {
+      throw persistenceError("read user question limit", error);
+    }
+
+    return parseUserQuestionLimitStatus(data as UserQuestionLimitStatusRow);
+  }
+
   async reserveDailyQuestion(
     discordGuildId: string,
     discordUserId: string,
@@ -688,7 +803,7 @@ export class SupabaseService {
       !Number.isSafeInteger(row.used) ||
       row.used < 0 ||
       (row.daily_limit !== null &&
-        (!Number.isSafeInteger(row.daily_limit) || row.daily_limit <= 0)) ||
+        (!Number.isSafeInteger(row.daily_limit) || row.daily_limit < 0)) ||
       (row.remaining !== null &&
         (!Number.isSafeInteger(row.remaining) || row.remaining < 0))
     ) {

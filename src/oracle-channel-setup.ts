@@ -99,6 +99,47 @@ export function buildOracleCommand() {
           subcommand
             .setName("off")
             .setDescription("Disable the daily AI-question limit."),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("user")
+            .setDescription("Set one user's personal daily question limit.")
+            .addUserOption((option) =>
+              option
+                .setName("user")
+                .setDescription("User whose personal limit should change.")
+                .setRequired(true),
+            )
+            .addIntegerOption((option) =>
+              option
+                .setName("limit")
+                .setDescription("Personal questions per UTC day; 0 blocks access.")
+                .setRequired(true)
+                .setMinValue(0)
+                .setMaxValue(1_000),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("reset-user")
+            .setDescription("Remove a user's personal daily-limit override.")
+            .addUserOption((option) =>
+              option
+                .setName("user")
+                .setDescription("User who should return to the server default.")
+                .setRequired(true),
+            ),
+        )
+        .addSubcommand((subcommand) =>
+          subcommand
+            .setName("status")
+            .setDescription("Inspect one user's effective daily allowance.")
+            .addUserOption((option) =>
+              option
+                .setName("user")
+                .setDescription("User whose allowance should be shown.")
+                .setRequired(true),
+            ),
         ),
     )
     .addSubcommandGroup((group) =>

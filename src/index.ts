@@ -44,11 +44,19 @@ import {
   type ConversationMessage,
 } from "./conversation-context.js";
 import {
+  BLOCKED_QUESTION_MESSAGE,
   formatRemainingQuestions,
+  formatUserQuestionLimitStatus,
   limitReachedMessage,
   shouldReserveDailyQuestion,
   type DailyQuestionReservation,
+  type UserQuestionLimitStatus,
 } from "./daily-limit.js";
+import {
+  classifyGenuineKartingIntent,
+  formatNonsenseResponse,
+  NONSENSE_PROCESSING_PLAN,
+} from "./intent-gate.js";
 import {
   buildFeedbackButtons,
   feedbackButtonFromCustomId,
@@ -1053,20 +1061,63 @@ async function main(): Promise<void> {
 
     try {
       if (group === ORACLE_LIMIT_GROUP_NAME) {
-        const dailyLimit =
-          subcommand === "daily"
-            ? interaction.options.getInteger("number", true)
-            : null;
-        const savedLimit = await database.setGuildDailyQuestionLimit(
-          interaction.guildId,
-          dailyLimit,
-          interaction.user.id,
+        if (subcommand === "daily" || subcommand === "off") {
+          const dailyLimit =
+            subcommand === "daily"
+              ? interaction.options.getInteger("number", true)
+              : null;
+          const savedLimit = await database.setGuildDailyQuestionLimit(
+            interaction.guildId,
+            dailyLimit,
+            interaction.user.id,
+          );
+
+          await interaction.editReply(
+            savedLimit === undefined
+              ? "Daily AI-question limits are now off for this server."
+              : `Non-moderators may now ask ${savedLimit} AI question${savedLimit === 1 ? "" : "s"} per UTC day.`,
+          );
+          return;
+        }
+
+        const targetUser = interaction.options.getUser("user", true);
+        let status: UserQuestionLimitStatus;
+
+        if (subcommand === "user") {
+          const personalLimit = interaction.options.getInteger("limit", true);
+          status = await database.setUserDailyQuestionLimit(
+            interaction.guildId,
+            targetUser.id,
+            personalLimit,
+            interaction.user.id,
+          );
+        } else if (subcommand === "reset-user") {
+          status = await database.resetUserDailyQuestionLimit(
+            interaction.guildId,
+            targetUser.id,
+          );
+        } else {
+          status = await database.getUserQuestionLimitStatus(
+            interaction.guildId,
+            targetUser.id,
+          );
+        }
+
+        const actionNotice =
+          subcommand === "user"
+            ? status.isBlocked
+              ? `Question access blocked for **${targetUser.username}**.`
+              : `Personal daily limit updated for **${targetUser.username}**.`
+            : subcommand === "reset-user"
+              ? `Personal daily-limit override removed for **${targetUser.username}**.`
+              : undefined;
+        const statusText = formatUserQuestionLimitStatus(
+          targetUser.username,
+          status,
         );
 
         await interaction.editReply(
-          savedLimit === undefined
-            ? "Daily AI-question limits are now off for this server."
-            : `Non-moderators may now ask ${savedLimit} AI question${savedLimit === 1 ? "" : "s"} per UTC day.`,
+          actionNotice ? `${actionNotice}\n\n${statusText}` : statusText,
         );
         return;
       }
@@ -1548,52 +1599,13 @@ async function main(): Promise<void> {
         });
     };
 
-    let history: ConversationMessage[];
-
-    try {
-      const storedHistory = await database.getConversationHistory(
-        message.guildId,
-        message.author.id,
-        conversationLimits.maxMessages * 2,
-      );
-      history = selectConversationContext(
-        storedHistory,
-        message.guildId,
-        message.author.id,
-        conversationLimits,
-      );
-    } catch (error) {
-      logDatabaseError("Could not load conversation history", error);
-      await sendFailure(
-        "Sorry, I could not load your conversation context right now. Please try again in a moment.",
-      );
-      return;
-    }
-
-    const [verifiedKnowledge, structuredKnowledge] = await Promise.all([
-      database.searchVerifiedKnowledge(effectivePrompt, 3).catch((error: unknown) => {
-        logDatabaseError(
-          "Verified knowledge search failed; answering without it",
-          error,
-        );
-        return [] as VerifiedKnowledge[];
-      }),
-      database.searchStructuredKnowledge(effectivePrompt, 4).catch((error: unknown) => {
-        logDatabaseError(
-          "Structured knowledge search failed; answering without it",
-          error,
-        );
-        return [];
-      }),
-    ]);
-
-    const topic = classifyTopic(
+    const initialTopic = classifyTopic(
       effectivePrompt,
-      history.length > 0,
-      verifiedKnowledge.length > 0 || structuredKnowledge.length > 0,
+      Boolean(pendingClarification),
+      false,
     );
 
-    if (topic === "obviously_off_topic") {
+    if (initialTopic === "obviously_off_topic") {
       await sendFailure(OFF_TOPIC_RESPONSE);
       return;
     }
@@ -1635,13 +1647,17 @@ async function main(): Promise<void> {
       }
 
       if (!reservation.allowed) {
-        await sendFailure(limitReachedMessage(reservation.dailyLimit ?? 0));
+        await sendFailure(
+          reservation.dailyLimit === 0
+            ? BLOCKED_QUESTION_MESSAGE
+            : limitReachedMessage(reservation.dailyLimit ?? 0),
+        );
         return;
       }
     }
 
     const releaseReservation = async (): Promise<void> => {
-      if (reservation?.dailyLimit === undefined || !reservation.allowed) {
+      if (!reservation?.allowed) {
         return;
       }
 
@@ -1654,6 +1670,112 @@ async function main(): Promise<void> {
         logDatabaseError("Could not release daily question reservation", error);
       }
     };
+
+    const completeReservation = async (): Promise<boolean> => {
+      if (!reservation?.allowed) {
+        return true;
+      }
+
+      let completionError: unknown;
+
+      for (const retryDelay of [0, 250, 1_000]) {
+        if (retryDelay > 0) {
+          await wait(retryDelay);
+        }
+
+        try {
+          await database.completeDailyQuestion(
+            message.guildId,
+            message.author.id,
+          );
+          completionError = undefined;
+          break;
+        } catch (error) {
+          completionError = error;
+        }
+      }
+
+      if (completionError) {
+        logDatabaseError(
+          "Could not finalize successful daily question usage",
+          completionError,
+        );
+        return false;
+      }
+
+      return true;
+    };
+
+    const intent = clarificationResolution.isClarificationReply
+      ? "genuine"
+      : classifyGenuineKartingIntent(effectivePrompt);
+
+    if (intent === "obvious_nonsense") {
+      if (
+        NONSENSE_PROCESSING_PLAN.consumeReservedQuestion &&
+        !(await completeReservation())
+      ) {
+        await sendFailure(
+          "Sorry, I could not update your daily question allowance right now. Please try again.",
+        );
+        return;
+      }
+
+      await sendFailure(formatNonsenseResponse(reservation));
+      return;
+    }
+
+    let history: ConversationMessage[];
+
+    try {
+      const storedHistory = await database.getConversationHistory(
+        message.guildId,
+        message.author.id,
+        conversationLimits.maxMessages * 2,
+      );
+      history = selectConversationContext(
+        storedHistory,
+        message.guildId,
+        message.author.id,
+        conversationLimits,
+      );
+    } catch (error) {
+      logDatabaseError("Could not load conversation history", error);
+      await releaseReservation();
+      await sendFailure(
+        "Sorry, I could not load your conversation context right now. Please try again in a moment.",
+      );
+      return;
+    }
+
+    const [verifiedKnowledge, structuredKnowledge] = await Promise.all([
+      database.searchVerifiedKnowledge(effectivePrompt, 3).catch((error: unknown) => {
+        logDatabaseError(
+          "Verified knowledge search failed; answering without it",
+          error,
+        );
+        return [] as VerifiedKnowledge[];
+      }),
+      database.searchStructuredKnowledge(effectivePrompt, 4).catch((error: unknown) => {
+        logDatabaseError(
+          "Structured knowledge search failed; answering without it",
+          error,
+        );
+        return [];
+      }),
+    ]);
+
+    const topic = classifyTopic(
+      effectivePrompt,
+      history.length > 0,
+      verifiedKnowledge.length > 0 || structuredKnowledge.length > 0,
+    );
+
+    if (topic === "obviously_off_topic") {
+      await releaseReservation();
+      await sendFailure(OFF_TOPIC_RESPONSE);
+      return;
+    }
 
     let oracleAnswer: OracleAnswer;
 
@@ -1846,33 +1968,7 @@ async function main(): Promise<void> {
       );
     }
 
-    if (reservation?.dailyLimit !== undefined && reservation.allowed) {
-      let completionError: unknown;
-
-      for (const retryDelay of [0, 250, 1_000]) {
-        if (retryDelay > 0) {
-          await wait(retryDelay);
-        }
-
-        try {
-          await database.completeDailyQuestion(
-            message.guildId,
-            message.author.id,
-          );
-          completionError = undefined;
-          break;
-        } catch (error) {
-          completionError = error;
-        }
-      }
-
-      if (completionError) {
-        logDatabaseError(
-          "Could not finalize successful daily question usage",
-          completionError,
-        );
-      }
-    }
+    await completeReservation();
 
     let attachmentError: unknown;
 
