@@ -26,10 +26,19 @@ test("registers the setup route as /oracle setup", () => {
   assert.equal(command.name, ORACLE_COMMAND_NAME);
   assert.deepEqual(
     command.options?.map((option) => option.name),
-    [ORACLE_SETUP_SUBCOMMAND_NAME, "reset", "limit", "knowledge"],
+    [ORACLE_SETUP_SUBCOMMAND_NAME, "reset", "ignore", "limit", "knowledge"],
   );
   assert.equal(isOracleSetupCommand("oracle", "setup"), true);
   assert.equal(isOracleSetupCommand("oracle-setup", null), false);
+});
+
+test("registers /oracle ignore with one required message option", () => {
+  const command = buildOracleCommand().toJSON();
+  const ignore = command.options?.find((option) => option.name === "ignore");
+
+  assert.equal(ignore?.options?.length, 1);
+  assert.equal(ignore?.options?.[0]?.name, "message");
+  assert.equal(ignore?.options?.[0]?.required, true);
 });
 
 test("registers moderator user-limit management under /oracle limit", () => {

@@ -177,7 +177,11 @@ Configured moderators can use:
 /oracle knowledge deactivate
 ```
 
+Anyone can use `/oracle ignore message:<text>` inside the configured Oracle channel to post an attributed public chat message without invoking Oracle. It does not run intent classification, call OpenAI or web search, load or alter conversation context, write conversation history, or consume daily allowance. Outside the configured Oracle channel, the command returns an ephemeral explanation instead.
+
 Daily limits apply only to non-moderators. A personal override takes precedence over the server default; `limit:0` blocks new Oracle questions until the override changes or is removed. Removing an override returns the user to the server default. A database transaction atomically reserves an allowance before OpenAI is called. The reservation is released when OpenAI fails, the request is rejected as off-topic, persistence fails, or Discord cannot receive the answer. Voting, verification, setup, reset, knowledge commands, limit-management commands, and answer editing do not consume allowance.
+
+Every finite-limit interaction that consumes allowance ends with `⏳ Daily questions remaining: X`, including a final value of `0`. The notice is omitted for moderators, clarification replies, `/oracle ignore`, and other interactions that do not consume a question.
 
 Every eligible message first passes through a small structured semantic-intent request using `gpt-5-mini`. It receives only the first 800 characters of the raw message, uses minimal reasoning with a 160-output-token cap, and has no tools, history, or knowledge. It classifies the message as `GENUINE_KARTING`, `NONSENSE_OR_TROLLING`, `OFF_TOPIC`, `SAFETY_SENSITIVE`, or `UNCERTAIN` before clarification handling. Clearly unserious prompts consume one reserved daily question and receive a fixed response without history, knowledge, full answer generation, or web search. Potentially real ingestion, fire/fume, or serious-injury messages receive only a short fixed urgent-safety response and also consume one question. Genuine and uncertain messages continue through the normal Oracle flow.
 
@@ -240,6 +244,13 @@ Answer length is matched to question complexity: simple answers usually target 3
 5. Run `/oracle limit reset-user user:@TestUser`; confirm status returns to the server default without resetting today's usage.
 6. As a non-moderator, attempt a limit-management command and confirm it is denied ephemerally.
 7. With allowance available, ask `Is a kart tyre an optimal breakfast?`; confirm the short playful response appears, the remaining count decreases by one, and no AI answer buttons or web citation appear.
+
+### Normal chat with `/oracle ignore`
+
+1. In the configured Oracle channel, run `/oracle ignore message:Yeah mate I'll be there Sunday`.
+2. Confirm the bot publicly posts `💬 @YourName: Yeah mate I'll be there Sunday` with no remaining-question notice or answer buttons.
+3. Run the same command in another channel and confirm only you receive the ephemeral channel restriction message.
+4. Return to the Oracle channel and ask a context-dependent karting follow-up; confirm the ignored chat did not alter the existing Oracle conversation context.
 
 ### Structured knowledge
 

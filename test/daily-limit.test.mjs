@@ -12,14 +12,23 @@ import {
 import { memberHasModeratorRole } from "../dist/moderator-roles.js";
 
 test("shows remaining daily questions only when a limit is enabled", () => {
-  assert.match(
+  assert.equal(
     formatRemainingQuestions({
       allowed: true,
       dailyLimit: 5,
       used: 3,
       remaining: 2,
     }),
-    /2 questions/,
+    "⏳ Daily questions remaining: 2",
+  );
+  assert.equal(
+    formatRemainingQuestions({
+      allowed: true,
+      dailyLimit: 5,
+      used: 4,
+      remaining: 0,
+    }),
+    "⏳ Daily questions remaining: 0",
   );
   assert.equal(
     formatRemainingQuestions({ allowed: true, used: 0 }),

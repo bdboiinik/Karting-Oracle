@@ -67,6 +67,11 @@ import {
 } from "./feedback.js";
 import type { RecordedVote, VoteTotals, VoteType } from "./feedback-types.js";
 import {
+  buildIgnoreCommandResult,
+  IGNORE_MESSAGE_OPTION_NAME,
+  ORACLE_IGNORE_SUBCOMMAND_NAME,
+} from "./ignore-command.js";
+import {
   memberHasModeratorRole,
   resolveModeratorRoleIds,
 } from "./moderator-roles.js";
@@ -1045,6 +1050,29 @@ async function main(): Promise<void> {
     const group = interaction.options.getSubcommandGroup(false);
     const subcommand = interaction.options.getSubcommand();
 
+    if (!group && subcommand === ORACLE_IGNORE_SUBCOMMAND_NAME) {
+      const result = buildIgnoreCommandResult(
+        channelConfig.get(interaction.guildId),
+        interaction.channelId,
+        interaction.user.id,
+        interaction.options.getString(IGNORE_MESSAGE_OPTION_NAME, true),
+      );
+
+      if (!result.allowed) {
+        await interaction.reply({
+          content: result.content,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.reply({
+        content: result.content,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+
     if (!group && subcommand === ORACLE_RESET_SUBCOMMAND_NAME) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -1374,11 +1402,13 @@ async function main(): Promise<void> {
     const subcommand = interaction.options.getSubcommand(false);
     const isReset =
       group === null && subcommand === ORACLE_RESET_SUBCOMMAND_NAME;
+    const isIgnore =
+      group === null && subcommand === ORACLE_IGNORE_SUBCOMMAND_NAME;
     const isModeratorCommand =
       group === ORACLE_LIMIT_GROUP_NAME ||
       group === ORACLE_KNOWLEDGE_GROUP_NAME;
 
-    if (!isReset && !isModeratorCommand) {
+    if (!isReset && !isIgnore && !isModeratorCommand) {
       return;
     }
 

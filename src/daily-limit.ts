@@ -59,8 +59,7 @@ export function formatRemainingQuestions(
     return undefined;
   }
 
-  const noun = reservation.remaining === 1 ? "question" : "questions";
-  return `⏳ Daily AI questions remaining: ${reservation.remaining} ${noun}.`;
+  return `⏳ Daily questions remaining: ${reservation.remaining}`;
 }
 
 export function limitReachedMessage(limit: number): string {

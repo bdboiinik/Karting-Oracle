@@ -11,6 +11,11 @@ import {
 
 import { memberHasModeratorRole } from "./moderator-roles.js";
 import {
+  IGNORE_MESSAGE_MAX_LENGTH,
+  IGNORE_MESSAGE_OPTION_NAME,
+  ORACLE_IGNORE_SUBCOMMAND_NAME,
+} from "./ignore-command.js";
+import {
   KNOWLEDGE_CATEGORIES,
   KNOWLEDGE_CATEGORY_LABELS,
 } from "./structured-knowledge.js";
@@ -77,6 +82,19 @@ export function buildOracleCommand() {
       subcommand
         .setName(ORACLE_RESET_SUBCOMMAND_NAME)
         .setDescription("Clear your own Karting Oracle conversation context."),
+    )
+    .addSubcommand((subcommand) =>
+      subcommand
+        .setName(ORACLE_IGNORE_SUBCOMMAND_NAME)
+        .setDescription("Post a normal chat message without asking Oracle.")
+        .addStringOption((option) =>
+          option
+            .setName(IGNORE_MESSAGE_OPTION_NAME)
+            .setDescription("Message to post publicly in the Oracle channel.")
+            .setRequired(true)
+            .setMinLength(1)
+            .setMaxLength(IGNORE_MESSAGE_MAX_LENGTH),
+        ),
     )
     .addSubcommandGroup((group) =>
       group

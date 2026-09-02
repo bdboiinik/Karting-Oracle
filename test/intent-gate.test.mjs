@@ -84,7 +84,7 @@ test("nonsense consumes exactly one question and shows remaining allowance", () 
     remaining: 18,
   });
   assert.match(response, /Nice try/);
-  assert.match(response, /Daily AI questions remaining: 18/);
+  assert.match(response, /Daily questions remaining: 18/);
 });
 
 test("off-topic intent uses the existing response without consuming allowance", () => {
@@ -114,4 +114,14 @@ test("safety-sensitive ingestion gets only a short fixed safety response", () =>
   assert.match(result.plan.response, /unsafe to ingest/i);
   assert.match(result.plan.response, /urgent medical or poison-control advice/i);
   assert.ok(result.plan.response.length < 240);
+
+  assert.match(
+    formatTerminalIntentResponse(result.plan, {
+      allowed: true,
+      dailyLimit: 5,
+      used: 4,
+      remaining: 0,
+    }),
+    /⏳ Daily questions remaining: 0/,
+  );
 });
