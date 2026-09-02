@@ -2,19 +2,36 @@ import {
   formatRemainingQuestions,
   type DailyQuestionReservation,
 } from "./daily-limit.js";
+import {
+  type ClarificationResolution,
+  type PendingClarification,
+  resolvePendingClarification,
+} from "./clarification-state.js";
 
 export type GenuineIntentClassification = "genuine" | "obvious_nonsense";
 
 export interface NonsenseProcessingPlan {
-  consumeReservedQuestion: true;
+  dailyQuestionsConsumed: 1;
+  allowClarification: false;
   loadConversation: false;
   loadKnowledge: false;
   generateFullAnswer: false;
   allowWebSearch: false;
 }
 
+export type IntentGateResult =
+  | {
+      outcome: "reject_nonsense";
+      plan: NonsenseProcessingPlan;
+    }
+  | {
+      outcome: "continue";
+      clarification: ClarificationResolution;
+    };
+
 export const NONSENSE_PROCESSING_PLAN: NonsenseProcessingPlan = {
-  consumeReservedQuestion: true,
+  dailyQuestionsConsumed: 1,
+  allowClarification: false,
   loadConversation: false,
   loadKnowledge: false,
   generateFullAnswer: false,
@@ -26,7 +43,9 @@ export const NONSENSE_RESPONSE =
 const MODERATOR_NONSENSE_RESPONSE = "🏁 Nice try 😄";
 
 const NON_FOOD_EQUIPMENT =
-  "(?:(?:kart|racing)\\s+)?(?:tyres?|tires?|helmet|race suit|rib protector|steering wheel|engine|chassis|sprocket|brake disc)";
+  "(?:(?:kart|racing)\\s+)?(?:tyres?|tires?|helmet|race suit|rib protector|steering (?:wheel|column)|engine|chassis|sprocket|brake disc)";
+const ABSURD_ALTERNATIVE_OBJECT =
+  "(?:toothbrush|cereal bowl|soup bowl|drinking cup|dinner plate|toilet|pillow)";
 
 const OBVIOUS_NONSENSE_PATTERNS = [
   new RegExp(
@@ -40,8 +59,35 @@ const OBVIOUS_NONSENSE_PATTERNS = [
   /\b(?:eat|eating|edible)\b\s+(?:a|an|my|the)?\s*\b(?:kart|go[ -]?kart)\b/i,
   /\b(?:marry|wedding|honeymoon|romantically date)\b[\s\S]{0,60}\b(?:my\s+)?(?:kart|go[ -]?kart|helmet|tyre|tire)\b/i,
   /\b(?:kart|go[ -]?kart|helmet|tyre|tire)\b[\s\S]{0,60}\b(?:marry|wedding|honeymoon|romantically date)\b/i,
-  /\b(?:use|wear)\b[\s\S]{0,40}\b(?:helmet|tyre|tire|race suit)\b[\s\S]{0,40}\b(?:as|for)\b[\s\S]{0,20}\b(?:cereal bowl|soup bowl|drinking cup|dinner plate|toilet|pillow)\b/i,
+  new RegExp(
+    `\\b(?:can|could|should|may|would)\\s+i\\s+(?:use|wear|turn)\\s+(?:my|the|a|an)?\\s*${NON_FOOD_EQUIPMENT}\\b[\\s\\S]{0,35}\\b(?:as|for|into)\\s+(?:my|the|a|an)?\\s*${ABSURD_ALTERNATIVE_OBJECT}\\b`,
+    "i",
+  ),
 ];
+
+export function nonsenseProcessingPlan(
+  question: string,
+): NonsenseProcessingPlan | undefined {
+  return classifyGenuineKartingIntent(question) === "obvious_nonsense"
+    ? NONSENSE_PROCESSING_PLAN
+    : undefined;
+}
+
+export function resolveIntentBeforeClarification(
+  question: string,
+  pending: PendingClarification | undefined,
+): IntentGateResult {
+  const plan = nonsenseProcessingPlan(question);
+
+  if (plan) {
+    return { outcome: "reject_nonsense", plan };
+  }
+
+  return {
+    outcome: "continue",
+    clarification: resolvePendingClarification(pending, question),
+  };
+}
 
 export function classifyGenuineKartingIntent(
   question: string,

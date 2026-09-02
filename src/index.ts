@@ -35,7 +35,6 @@ import {
   createPendingClarification,
   isRepeatedClarification,
   PendingClarificationStore,
-  resolvePendingClarification,
   updatePendingClarification,
 } from "./clarification-state.js";
 import {
@@ -53,9 +52,8 @@ import {
   type UserQuestionLimitStatus,
 } from "./daily-limit.js";
 import {
-  classifyGenuineKartingIntent,
   formatNonsenseResponse,
-  NONSENSE_PROCESSING_PLAN,
+  resolveIntentBeforeClarification,
 } from "./intent-gate.js";
 import {
   buildFeedbackButtons,
@@ -1582,11 +1580,6 @@ async function main(): Promise<void> {
       message.guildId,
       message.author.id,
     );
-    const clarificationResolution = resolvePendingClarification(
-      pendingClarification,
-      prompt,
-    );
-    const effectivePrompt = clarificationResolution.effectiveQuestion;
     const sendFailure = async (content: string): Promise<void> => {
       await message
         .reply({
@@ -1598,17 +1591,6 @@ async function main(): Promise<void> {
           console.error(`Failed to send a Discord error message: ${detail}`);
         });
     };
-
-    const initialTopic = classifyTopic(
-      effectivePrompt,
-      Boolean(pendingClarification),
-      false,
-    );
-
-    if (initialTopic === "obviously_off_topic") {
-      await sendFailure(OFF_TOPIC_RESPONSE);
-      return;
-    }
 
     let isModerator: boolean;
 
@@ -1627,12 +1609,11 @@ async function main(): Promise<void> {
 
     let reservation: DailyQuestionReservation | undefined;
 
-    if (
-      shouldReserveDailyQuestion(
-        isModerator,
-        clarificationResolution.isClarificationReply,
-      )
-    ) {
+    const reserveQuestion = async (): Promise<boolean> => {
+      if (reservation?.allowed) {
+        return true;
+      }
+
       try {
         reservation = await database.reserveDailyQuestion(
           message.guildId,
@@ -1643,7 +1624,7 @@ async function main(): Promise<void> {
         await sendFailure(
           "Sorry, I could not check your daily question allowance right now. Please try again.",
         );
-        return;
+        return false;
       }
 
       if (!reservation.allowed) {
@@ -1652,9 +1633,11 @@ async function main(): Promise<void> {
             ? BLOCKED_QUESTION_MESSAGE
             : limitReachedMessage(reservation.dailyLimit ?? 0),
         );
-        return;
+        return false;
       }
-    }
+
+      return true;
+    };
 
     const releaseReservation = async (): Promise<void> => {
       if (!reservation?.allowed) {
@@ -1706,13 +1689,57 @@ async function main(): Promise<void> {
       return true;
     };
 
-    const intent = clarificationResolution.isClarificationReply
-      ? "genuine"
-      : classifyGenuineKartingIntent(effectivePrompt);
+    // New questions reserve first so blocked/exhausted users are rejected before
+    // classification. Pending replies only need a status read here because a
+    // genuine Oracle-requested clarification must not consume another question.
+    if (!isModerator && !pendingClarification && !(await reserveQuestion())) {
+      return;
+    }
 
-    if (intent === "obvious_nonsense") {
+    if (!isModerator && pendingClarification) {
+      try {
+        const status = await database.getUserQuestionLimitStatus(
+          message.guildId,
+          message.author.id,
+        );
+
+        if (status.isBlocked) {
+          await sendFailure(BLOCKED_QUESTION_MESSAGE);
+          return;
+        }
+      } catch (error) {
+        logDatabaseError("Could not check the daily question allowance", error);
+        await sendFailure(
+          "Sorry, I could not check your daily question allowance right now. Please try again.",
+        );
+        return;
+      }
+    }
+
+    const initialTopic = classifyTopic(
+      prompt,
+      Boolean(pendingClarification),
+      false,
+    );
+
+    if (initialTopic === "obviously_off_topic") {
+      await releaseReservation();
+      await sendFailure(OFF_TOPIC_RESPONSE);
+      return;
+    }
+
+    const intentGate = resolveIntentBeforeClarification(
+      prompt,
+      pendingClarification,
+    );
+
+    if (intentGate.outcome === "reject_nonsense") {
+      if (!isModerator && !reservation && !(await reserveQuestion())) {
+        return;
+      }
+
       if (
-        NONSENSE_PROCESSING_PLAN.consumeReservedQuestion &&
+        intentGate.plan.dailyQuestionsConsumed === 1 &&
         !(await completeReservation())
       ) {
         await sendFailure(
@@ -1722,6 +1749,20 @@ async function main(): Promise<void> {
       }
 
       await sendFailure(formatNonsenseResponse(reservation));
+      return;
+    }
+
+    const clarificationResolution = intentGate.clarification;
+    const effectivePrompt = clarificationResolution.effectiveQuestion;
+
+    if (
+      shouldReserveDailyQuestion(
+        isModerator,
+        clarificationResolution.isClarificationReply,
+      ) &&
+      !reservation &&
+      !(await reserveQuestion())
+    ) {
       return;
     }
 
