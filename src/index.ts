@@ -52,9 +52,14 @@ import {
   type UserQuestionLimitStatus,
 } from "./daily-limit.js";
 import {
-  formatNonsenseResponse,
-  resolveIntentBeforeClarification,
+  formatTerminalIntentResponse,
+  resolveClassifiedIntentBeforeClarification,
 } from "./intent-gate.js";
+import {
+  buildIntentClassifierRequest,
+  parseIntentClassification,
+  type IntentClassificationResult,
+} from "./intent-classifier.js";
 import {
   buildFeedbackButtons,
   feedbackButtonFromCustomId,
@@ -239,6 +244,28 @@ async function main(): Promise<void> {
       GatewayIntentBits.MessageContent,
     ],
   });
+
+  async function classifyIncomingMessage(
+    prompt: string,
+  ): Promise<IntentClassificationResult> {
+    const response = await openai.responses.create(
+      buildIntentClassifierRequest(OPENAI_MODEL, prompt),
+    );
+    const responseText = response.output_text.trim();
+
+    if (!responseText) {
+      throw new Error(
+        [
+          "OpenAI returned no intent classification",
+          `status=${response.status}`,
+          `reason=${response.incomplete_details?.reason ?? "none"}`,
+          `error=${response.error ? safeErrorDetails(response.error) : "none"}`,
+        ].join(", "),
+      );
+    }
+
+    return parseIntentClassification(responseText);
+  }
 
   async function generateOracleAnswer(
     prompt: string,
@@ -1716,24 +1743,40 @@ async function main(): Promise<void> {
       }
     }
 
-    const initialTopic = classifyTopic(
-      prompt,
-      Boolean(pendingClarification),
-      false,
-    );
+    let intentClassification: IntentClassificationResult;
 
-    if (initialTopic === "obviously_off_topic") {
+    try {
+      intentClassification = await withTypingIndicator(
+        () => message.channel.sendTyping(),
+        () => classifyIncomingMessage(prompt),
+      );
+      console.log(
+        `[intent] classification=${intentClassification.classification} safety_category=${intentClassification.safetyCategory}`,
+      );
+    } catch (error) {
+      console.error(
+        `[intent] classification=failed error=${safeErrorDetails(error)}`,
+      );
       await releaseReservation();
-      await sendFailure(OFF_TOPIC_RESPONSE);
+      await sendFailure(
+        "Sorry, I could not classify that question safely right now. Please try again.",
+      );
       return;
     }
 
-    const intentGate = resolveIntentBeforeClarification(
+    const intentGate = resolveClassifiedIntentBeforeClarification(
+      intentClassification,
       prompt,
       pendingClarification,
     );
 
-    if (intentGate.outcome === "reject_nonsense") {
+    if (intentGate.outcome === "respond") {
+      if (intentGate.plan.dailyQuestionsConsumed === 0) {
+        await releaseReservation();
+        await sendFailure(intentGate.plan.response);
+        return;
+      }
+
       if (!isModerator && !reservation && !(await reserveQuestion())) {
         return;
       }
@@ -1748,7 +1791,9 @@ async function main(): Promise<void> {
         return;
       }
 
-      await sendFailure(formatNonsenseResponse(reservation));
+      await sendFailure(
+        formatTerminalIntentResponse(intentGate.plan, reservation),
+      );
       return;
     }
 

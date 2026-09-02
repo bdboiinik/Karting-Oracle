@@ -1,63 +1,83 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-  classifyGenuineKartingIntent,
-  formatNonsenseResponse,
-  nonsenseProcessingPlan,
-  NONSENSE_PROCESSING_PLAN,
-  NONSENSE_RESPONSE,
-  resolveIntentBeforeClarification,
-} from "../dist/intent-gate.js";
 import { createPendingClarification } from "../dist/clarification-state.js";
+import {
+  formatTerminalIntentResponse,
+  NONSENSE_RESPONSE,
+  resolveClassifiedIntentBeforeClarification,
+} from "../dist/intent-gate.js";
 
-test("genuine, basic, and unusual karting questions continue normally", () => {
-  for (const question of [
-    "What should I eat before a karting race?",
-    "What tyre pressures should I run?",
-    "Why am I losing time in wet conditions?",
-    "Is karting good exercise?",
-    "Why does my kart feel happier in the rain?",
-    "Can I eat with my helmet on between sessions?",
-    "What food should I bring, and do I need my helmet?",
-    "How do I clean a steering column?",
-    "Can a dirty steering wheel make you ill?",
-    "What should I eat before karting?",
-    "Can karting make you dizzy?",
-  ]) {
-    assert.equal(classifyGenuineKartingIntent(question), "genuine", question);
-  }
-});
+function classified(classification, safetyCategory = "none") {
+  return { classification, safetyCategory };
+}
 
-test("clear karting-word nonsense gets the fixed short response", () => {
-  for (const question of [
-    "Is a kart tyre an optimal breakfast?",
-    "Can I use the steering column as a toothbrush?",
-    "Can I eat a kart tyre?",
-    "Can I marry my kart?",
-    "Can I use my helmet as a cereal bowl?",
+test("genuine and genuinely uncertain karting intents continue normally", () => {
+  for (const [question, classification] of [
+    ["How can a beginner improve wet-weather braking?", "GENUINE_KARTING"],
+    ["Can karting make someone feel dizzy?", "GENUINE_KARTING"],
+    ["How should a steering column be cleaned safely?", "GENUINE_KARTING"],
+    ["What about the other chassis?", "UNCERTAIN"],
   ]) {
-    assert.equal(
-      classifyGenuineKartingIntent(question),
-      "obvious_nonsense",
+    const result = resolveClassifiedIntentBeforeClarification(
+      classified(classification),
       question,
+      undefined,
     );
+    assert.equal(result.outcome, "continue", question);
   }
-
-  assert.ok(NONSENSE_RESPONSE.length < 100);
 });
 
-test("nonsense consumes its reservation without retrieval or generation", () => {
-  assert.deepEqual(NONSENSE_PROCESSING_PLAN, {
-    dailyQuestionsConsumed: 1,
-    allowClarification: false,
-    loadConversation: false,
-    loadKnowledge: false,
-    generateFullAnswer: false,
-    allowWebSearch: false,
-  });
+test("different trolling and absurd-misuse intents stop immediately", () => {
+  const unseenVariants = [
+    "Could a sprocket double as my dinner plate?",
+    "Would fitting balloons make my kart fly to the moon?",
+    "Should I challenge my brake pedal to a wrestling match?",
+  ];
 
-  const response = formatNonsenseResponse({
+  for (const question of unseenVariants) {
+    const result = resolveClassifiedIntentBeforeClarification(
+      classified("NONSENSE_OR_TROLLING"),
+      question,
+      undefined,
+    );
+
+    assert.equal(result.outcome, "respond", question);
+    assert.equal(result.plan.response, NONSENSE_RESPONSE);
+    assert.equal(result.plan.dailyQuestionsConsumed, 1);
+    assert.equal(result.plan.allowClarification, false);
+    assert.equal(result.plan.loadConversation, false);
+    assert.equal(result.plan.loadKnowledge, false);
+    assert.equal(result.plan.allowWebSearch, false);
+    assert.equal(result.plan.generateFullAnswer, false);
+  }
+});
+
+test("obvious nonsense cannot become a clarification reply", () => {
+  const pending = createPendingClarification(
+    "Which steering component is making a noise?",
+    { missingInformation: "the steering component" },
+  );
+  const result = resolveClassifiedIntentBeforeClarification(
+    classified("NONSENSE_OR_TROLLING"),
+    "Could I teach that component to sing opera?",
+    pending,
+  );
+
+  assert.equal(result.outcome, "respond");
+  assert.equal("clarification" in result, false);
+});
+
+test("nonsense consumes exactly one question and shows remaining allowance", () => {
+  const result = resolveClassifiedIntentBeforeClarification(
+    classified("NONSENSE_OR_TROLLING"),
+    "An absurd prompt not listed in production instructions",
+    undefined,
+  );
+  assert.equal(result.outcome, "respond");
+  assert.equal(result.plan.dailyQuestionsConsumed, 1);
+
+  const response = formatTerminalIntentResponse(result.plan, {
     allowed: true,
     dailyLimit: 20,
     used: 1,
@@ -65,45 +85,33 @@ test("nonsense consumes its reservation without retrieval or generation", () => 
   });
   assert.match(response, /Nice try/);
   assert.match(response, /Daily AI questions remaining: 18/);
-  assert.equal(formatNonsenseResponse(undefined), "🏁 Nice try 😄");
 });
 
-test("obvious nonsense is routed before clarification and expensive work", () => {
-  const plan = nonsenseProcessingPlan(
-    "Can I use the steering column as a toothbrush?",
+test("off-topic intent uses the existing response without consuming allowance", () => {
+  const result = resolveClassifiedIntentBeforeClarification(
+    classified("OFF_TOPIC"),
+    "Explain a non-karting subject",
+    undefined,
   );
 
-  assert.ok(plan);
-  assert.equal(plan.allowClarification, false);
-  assert.equal(plan.loadConversation, false);
-  assert.equal(plan.loadKnowledge, false);
-  assert.equal(plan.allowWebSearch, false);
-  assert.equal(plan.generateFullAnswer, false);
-  assert.equal(plan.dailyQuestionsConsumed, 1);
+  assert.equal(result.outcome, "respond");
+  assert.match(result.plan.response, /only help with karting-related questions/i);
+  assert.equal(result.plan.dailyQuestionsConsumed, 0);
 });
 
-test("nonsense cannot become a clarification reply even when one is pending", () => {
-  const pending = createPendingClarification(
-    "Which steering component is making a noise?",
-    { missingInformation: "the steering component" },
-  );
-  const result = resolveIntentBeforeClarification(
-    "Can I use the steering column as a toothbrush?",
-    pending,
+test("safety-sensitive ingestion gets only a short fixed safety response", () => {
+  const result = resolveClassifiedIntentBeforeClarification(
+    classified("SAFETY_SENSITIVE", "chemical_ingestion"),
+    "Could someone swallow a liquid from the kart workshop?",
+    undefined,
   );
 
-  assert.equal(result.outcome, "reject_nonsense");
-  assert.equal("clarification" in result, false);
+  assert.equal(result.outcome, "respond");
+  assert.equal(result.plan.dailyQuestionsConsumed, 1);
   assert.equal(result.plan.allowClarification, false);
-});
-
-test("plausibly serious unusual questions have no early rejection plan", () => {
-  for (const question of [
-    "How do I clean a steering column?",
-    "Can a dirty steering wheel make you ill?",
-    "What should I eat before karting?",
-    "Can karting make you dizzy?",
-  ]) {
-    assert.equal(nonsenseProcessingPlan(question), undefined, question);
-  }
+  assert.equal(result.plan.allowWebSearch, false);
+  assert.equal(result.plan.generateFullAnswer, false);
+  assert.match(result.plan.response, /unsafe to ingest/i);
+  assert.match(result.plan.response, /urgent medical or poison-control advice/i);
+  assert.ok(result.plan.response.length < 240);
 });

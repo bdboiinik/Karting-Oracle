@@ -1,111 +1,109 @@
 import {
-  formatRemainingQuestions,
-  type DailyQuestionReservation,
-} from "./daily-limit.js";
-import {
   type ClarificationResolution,
   type PendingClarification,
   resolvePendingClarification,
 } from "./clarification-state.js";
+import {
+  formatRemainingQuestions,
+  type DailyQuestionReservation,
+} from "./daily-limit.js";
+import type {
+  IntentClassificationResult,
+  SafetyCategory,
+} from "./intent-classifier.js";
+import { OFF_TOPIC_RESPONSE } from "./topic-gate.js";
 
-export type GenuineIntentClassification = "genuine" | "obvious_nonsense";
-
-export interface NonsenseProcessingPlan {
-  dailyQuestionsConsumed: 1;
+export interface TerminalIntentPlan {
+  dailyQuestionsConsumed: 0 | 1;
   allowClarification: false;
   loadConversation: false;
   loadKnowledge: false;
   generateFullAnswer: false;
   allowWebSearch: false;
+  response: string;
 }
 
 export type IntentGateResult =
   | {
-      outcome: "reject_nonsense";
-      plan: NonsenseProcessingPlan;
+      outcome: "respond";
+      plan: TerminalIntentPlan;
     }
   | {
       outcome: "continue";
       clarification: ClarificationResolution;
     };
 
-export const NONSENSE_PROCESSING_PLAN: NonsenseProcessingPlan = {
-  dailyQuestionsConsumed: 1,
-  allowClarification: false,
-  loadConversation: false,
-  loadKnowledge: false,
-  generateFullAnswer: false,
-  allowWebSearch: false,
-};
-
 export const NONSENSE_RESPONSE =
   "🏁 Nice try 😄 That still counts as one of your daily questions.";
 const MODERATOR_NONSENSE_RESPONSE = "🏁 Nice try 😄";
 
-const NON_FOOD_EQUIPMENT =
-  "(?:(?:kart|racing)\\s+)?(?:tyres?|tires?|helmet|race suit|rib protector|steering (?:wheel|column)|engine|chassis|sprocket|brake disc)";
-const ABSURD_ALTERNATIVE_OBJECT =
-  "(?:toothbrush|cereal bowl|soup bowl|drinking cup|dinner plate|toilet|pillow)";
+const SAFETY_RESPONSES: Record<Exclude<SafetyCategory, "none">, string> = {
+  chemical_ingestion:
+    "No — karting fuel, oil, and other chemicals are unsafe to ingest. If this may have happened, seek urgent medical or poison-control advice now.",
+  fire_or_fumes:
+    "Move away from the fire or fumes and get to fresh air. If anyone is in danger or unwell, contact emergency services now.",
+  serious_injury:
+    "Stop karting and seek urgent medical help. Call emergency services if the injury is severe or anyone is in immediate danger.",
+  other_urgent:
+    "Stop and get help from a responsible adult, track official, or medical professional. Contact emergency services if anyone is in immediate danger.",
+};
 
-const OBVIOUS_NONSENSE_PATTERNS = [
-  new RegExp(
-    `\\b(?:is|are|would|could)\\s+(?:a|an|my|the)?\\s*${NON_FOOD_EQUIPMENT}\\b[\\s\\S]{0,45}\\b(?:breakfast|lunch|dinner|snack|meal|food|edible|delicious)\\b`,
-    "i",
-  ),
-  new RegExp(
-    `\\b(?:eat|serve|have)\\s+(?:a|an|my|the)?\\s*${NON_FOOD_EQUIPMENT}\\b(?:\\s+(?:for|as)\\s+(?:breakfast|lunch|dinner|a snack|a meal))?`,
-    "i",
-  ),
-  /\b(?:eat|eating|edible)\b\s+(?:a|an|my|the)?\s*\b(?:kart|go[ -]?kart)\b/i,
-  /\b(?:marry|wedding|honeymoon|romantically date)\b[\s\S]{0,60}\b(?:my\s+)?(?:kart|go[ -]?kart|helmet|tyre|tire)\b/i,
-  /\b(?:kart|go[ -]?kart|helmet|tyre|tire)\b[\s\S]{0,60}\b(?:marry|wedding|honeymoon|romantically date)\b/i,
-  new RegExp(
-    `\\b(?:can|could|should|may|would)\\s+i\\s+(?:use|wear|turn)\\s+(?:my|the|a|an)?\\s*${NON_FOOD_EQUIPMENT}\\b[\\s\\S]{0,35}\\b(?:as|for|into)\\s+(?:my|the|a|an)?\\s*${ABSURD_ALTERNATIVE_OBJECT}\\b`,
-    "i",
-  ),
-];
-
-export function nonsenseProcessingPlan(
-  question: string,
-): NonsenseProcessingPlan | undefined {
-  return classifyGenuineKartingIntent(question) === "obvious_nonsense"
-    ? NONSENSE_PROCESSING_PLAN
-    : undefined;
-}
-
-export function resolveIntentBeforeClarification(
-  question: string,
-  pending: PendingClarification | undefined,
-): IntentGateResult {
-  const plan = nonsenseProcessingPlan(question);
-
-  if (plan) {
-    return { outcome: "reject_nonsense", plan };
-  }
-
+function terminalPlan(
+  response: string,
+  dailyQuestionsConsumed: 0 | 1,
+): TerminalIntentPlan {
   return {
-    outcome: "continue",
-    clarification: resolvePendingClarification(pending, question),
+    dailyQuestionsConsumed,
+    allowClarification: false,
+    loadConversation: false,
+    loadKnowledge: false,
+    generateFullAnswer: false,
+    allowWebSearch: false,
+    response,
   };
 }
 
-export function classifyGenuineKartingIntent(
+export function resolveClassifiedIntentBeforeClarification(
+  result: IntentClassificationResult,
   question: string,
-): GenuineIntentClassification {
-  return OBVIOUS_NONSENSE_PATTERNS.some((pattern) => pattern.test(question))
-    ? "obvious_nonsense"
-    : "genuine";
+  pending: PendingClarification | undefined,
+): IntentGateResult {
+  switch (result.classification) {
+    case "NONSENSE_OR_TROLLING":
+      return { outcome: "respond", plan: terminalPlan(NONSENSE_RESPONSE, 1) };
+    case "OFF_TOPIC":
+      return { outcome: "respond", plan: terminalPlan(OFF_TOPIC_RESPONSE, 0) };
+    case "SAFETY_SENSITIVE":
+      return {
+        outcome: "respond",
+        plan: terminalPlan(
+          SAFETY_RESPONSES[
+            result.safetyCategory as Exclude<SafetyCategory, "none">
+          ],
+          1,
+        ),
+      };
+    case "GENUINE_KARTING":
+    case "UNCERTAIN":
+      return {
+        outcome: "continue",
+        clarification: resolvePendingClarification(pending, question),
+      };
+  }
 }
 
-export function formatNonsenseResponse(
+export function formatTerminalIntentResponse(
+  plan: TerminalIntentPlan,
   reservation: DailyQuestionReservation | undefined,
 ): string {
-  if (!reservation) {
-    return MODERATOR_NONSENSE_RESPONSE;
-  }
+  const baseResponse =
+    plan.response === NONSENSE_RESPONSE && !reservation
+      ? MODERATOR_NONSENSE_RESPONSE
+      : plan.response;
+  const remaining =
+    plan.dailyQuestionsConsumed === 1 && reservation
+      ? formatRemainingQuestions(reservation)
+      : undefined;
 
-  const remaining = formatRemainingQuestions(reservation);
-  return remaining
-    ? `${NONSENSE_RESPONSE}\n\n${remaining}`
-    : NONSENSE_RESPONSE;
+  return remaining ? `${baseResponse}\n\n${remaining}` : baseResponse;
 }
